@@ -12,6 +12,19 @@ struct SimpleVertex
     float Tex[2]; // Текстурные координаты U, V для видеопотока
 };
 
+// Структура параметров кадра для передачи в шейдеры
+struct ShaderConstants
+{
+    float width;     // Ширина картинки
+    float height;    // Высота картинки
+    float d_width;   // Шаг одного пикселя по горизонтали (1.0 / width)
+    float d_height;  // Шаг одного пикселя по вертикали (1.0 / height)
+};
+
+// Глобальный указатель на буфер констант
+ID3D11Buffer* g_pConstantBuffer = NULL;
+
+
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (СТРОГО ПО ОДНОМУ ЭКЗЕМПЛЯРУ): ---
 ID3D11Device* g_pd3dDevice = NULL;        // Видеокарта
 ID3D11DeviceContext* g_pImmediateContext = NULL; // Контекст команд
@@ -178,6 +191,18 @@ HRESULT InitDevice(HWND hwnd)
     hr = g_pd3dDevice->CreateSamplerState(&sampDesc, &g_pSamplerState);
     if (FAILED(hr)) return hr;
 
+    // === НОВЫЙ КОД: СОЗДАЕМ БУФЕР КОНСТАНТ НА ВИДЕОКАРТЕ ===
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.ByteWidth = sizeof(ShaderConstants);      // Размер нашей структуры параметров
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;  // Указываем видеокарте, что это буфер констант
+    cbd.CPUAccessFlags = 0;
+
+    hr = g_pd3dDevice->CreateBuffer(&cbd, NULL, &g_pConstantBuffer);
+    if (FAILED(hr)) return hr;
+    // === КОНЕЦ НОВОГО КОДА ===
+
+
     // Геометрия прямоугольного экрана
     SimpleVertex vertices[] =
     {
@@ -217,6 +242,20 @@ void Render()
 
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
+    
+    // === НОВЫЙ КОД: ОБНОВЛЯЕМ ПАРАМЕТРЫ КАДРА ДЛЯ ШЕЙДЕРОВ ===
+    ShaderConstants cbData;
+    cbData.width = 2.0f;                      // Наша тестовая текстура имеет ширину 2 пикселя
+    cbData.height = 2.0f;                     // И высоту 2 пикселя
+    cbData.d_width = 1.0f / cbData.width;     // Шаг одного пикселя по горизонтали (0.5)
+    cbData.d_height = 1.0f / cbData.height;   // Шаг одного пикселя по вертикали (0.5)
+
+    // Загружаем эти данные в буфер констант на видеокарте
+    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
+
+    // Привязываем буфер констант к пиксельному шейдеру в слот c0 (регистр c0)
+    g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+    // === КОНЕЦ НОВОГО КОДА ===
 
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
     g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState); // Связываем наш POINT-сэмплер
@@ -232,6 +271,7 @@ void CleanupDevice()
     if (g_pImmediateContext) g_pImmediateContext->ClearState();
 
     if (g_pSamplerState) { g_pSamplerState->Release(); g_pSamplerState = NULL; }
+    if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = NULL; } // НОВОЕ: Очистка буфера констант
     if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
     if (g_pVertexBuffer) { g_pVertexBuffer->Release(); g_pVertexBuffer = NULL; }
     if (g_pVertexLayout) { g_pVertexLayout->Release(); g_pVertexLayout = NULL; }
@@ -244,7 +284,7 @@ void CleanupDevice()
 }
 
 // Главная точка входа Windows-приложения
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
+int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow)
 {
     const wchar_t CLASS_NAME[] = L"MyVideoPlayerWindowClass";
     WNDCLASS wc = { };
