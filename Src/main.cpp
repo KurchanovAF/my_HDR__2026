@@ -24,6 +24,13 @@ struct ShaderConstants
 // Глобальный указатель на буфер констант
 ID3D11Buffer* g_pConstantBuffer = NULL;
 
+// === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ СВЕРТКИ АНАЛИЗА БЛОКОВ 4х4 ===
+ID3D11RenderTargetView* g_pStage1RTV = NULL; // Холст для записи фиолетового анализа 3-го шейдера
+ID3D11ShaderResourceView* g_pStage1SRV = NULL; // Ссылка на этот анализ для следующего шейдера
+
+// === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ УКРУПНЕННОГО АНАЛИЗА МАКРОБЛОКОВ 8х8 ===
+ID3D11RenderTargetView* g_pStage2RTV = NULL; // Холст для записи макроанализа 4-го шейдера
+ID3D11ShaderResourceView* g_pStage2SRV = NULL; // Ссылка на макроанализ для последующих шейдеров
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (СТРОГО ПО ОДНОМУ ЭКЗЕМПЛЯРУ): ---
 ID3D11Device* g_pd3dDevice = NULL;        // Видеокарта
@@ -34,6 +41,8 @@ ID3D11RenderTargetView* g_pRenderTargetView = NULL; // Окно вывода
 ID3D11VertexShader* g_pVertexShader = NULL;     // Вершинный шейдер
 ID3D11PixelShader* g_pPixelShader = NULL;      // Пиксельный шейдер
 
+ID3D11PixelShader* g_pPixelShaderStage2 = NULL; // НОВОЕ: Указатель на 4-й шейдер анализа макроблоков 8х8
+
 ID3D11InputLayout* g_pVertexLayout = NULL;     // Формат вершин
 ID3D11Buffer* g_pVertexBuffer = NULL;     // Буфер геометрии
 
@@ -41,6 +50,8 @@ ID3D11ShaderResourceView* g_pTextureSRV = NULL;       // Наша текстур
 ID3D11SamplerState* g_pSamplerState = NULL;     // Жесткий сэмплер (Point)
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+void CleanupDevice(); // НОВОЕ: Объявляем функцию очистки заранее, чтобы убрать ошибку компиляции
 
 // Функция для компиляции HLSL-файлов
 HRESULT CompileShaderFromFile(const WCHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut)
@@ -149,6 +160,17 @@ HRESULT InitDevice(HWND hwnd)
     pPSBlob->Release();
     if (FAILED(hr)) return hr;
 
+    // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 4-ГО ШЕЙДЕРА (STAGE 2) ===
+    ID3DBlob* pPSStage2Blob = NULL;
+    // Указываем точку входа "PS_Stage2" — строго как имя функции в файле shaders.hlsl
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Stage2", "ps_4_0", &pPSStage2Blob);
+    if (FAILED(hr)) return hr;
+
+    hr = g_pd3dDevice->CreatePixelShader(pPSStage2Blob->GetBufferPointer(), pPSStage2Blob->GetBufferSize(), NULL, &g_pPixelShaderStage2);
+    pPSStage2Blob->Release(); // Освобождаем память временного буфера компиляции
+    if (FAILED(hr)) return hr;
+    // === КОНЕЦ НОВОГО КОДА ===
+
     // Создаем тестовую текстуру 2х2 пикселя (Черный и Белый в шахматном порядке)
     UINT textureData[] = {
         0xFFFFFFFF, 0xFF000000,
@@ -202,6 +224,58 @@ HRESULT InitDevice(HWND hwnd)
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
+        // === НОВЫЙ КОД: СОЗДАЕМ СКРЫТУЮ ТЕКСТУРУ ДЛЯ РЕЗУЛЬТАТОВ 3-ГО ШЕЙДЕРА ===
+    D3D11_TEXTURE2D_DESC stage1Desc = {};
+    stage1Desc.Width = 2;                             // Размер точно соответствует исходному кадру
+    stage1Desc.Height = 2;
+    stage1Desc.MipLevels = 1;
+    stage1Desc.ArraySize = 1;
+    stage1Desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;   // Стандартный RGBA формат для хранения данных
+    stage1Desc.SampleDesc.Count = 1;
+    stage1Desc.Usage = D3D11_USAGE_DEFAULT;
+    // Очень важные флаги: текстура будет одновременно холстом для записи и ресурсом для чтения!
+    stage1Desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    ID3D11Texture2D* pStage1Tex = NULL;
+    hr = g_pd3dDevice->CreateTexture2D(&stage1Desc, NULL, &pStage1Tex);
+    if (SUCCEEDED(hr))
+    {
+        // Создаем "взгляд для записи" (RenderTargetView) — сюда 3-й шейдер будет писать данные
+        g_pd3dDevice->CreateRenderTargetView(pStage1Tex, NULL, &g_pStage1RTV);
+
+        // Создаем "взгляд для чтения" (ShaderResourceView) — отсюда 4-й шейдер будет их забирать
+        g_pd3dDevice->CreateShaderResourceView(pStage1Tex, NULL, &g_pStage1SRV);
+
+        pStage1Tex->Release(); // Саму текстуру видеокарта удержит внутри интерфейсов
+    }
+    if (FAILED(hr)) return hr;
+    // === КОНЕЦ НОВОГО КОДА ===
+
+        // === НОВЫЙ КОД: СОЗДАЕМ СКРЫТУЮ ТЕКСТУРУ ДЛЯ РЕЗУЛЬТАТОВ 4-ГО ШЕЙДЕРА ===
+    D3D11_TEXTURE2D_DESC stage2Desc = {};
+    stage2Desc.Width = 2;                             // Размер по-прежнему соответствует тестовому кадру
+    stage2Desc.Height = 2;
+    stage2Desc.MipLevels = 1;
+    stage2Desc.ArraySize = 1;
+    stage2Desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;   // Формат RGBA для хранения макростатистики
+    stage2Desc.SampleDesc.Count = 1;
+    stage2Desc.Usage = D3D11_USAGE_DEFAULT;
+    stage2Desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    ID3D11Texture2D* pStage2Tex = NULL;
+    hr = g_pd3dDevice->CreateTexture2D(&stage2Desc, NULL, &pStage2Tex);
+    if (SUCCEEDED(hr))
+    {
+        // Создаем RenderTargetView — сюда 4-й шейдер запишет укрупненные данные 8х8
+        g_pd3dDevice->CreateRenderTargetView(pStage2Tex, NULL, &g_pStage2RTV);
+
+        // Создаем ShaderResourceView — отсюда данные заберет финальный сборочный шейдер
+        g_pd3dDevice->CreateShaderResourceView(pStage2Tex, NULL, &g_pStage2SRV);
+
+        pStage2Tex->Release();
+    }
+    if (FAILED(hr)) return hr;
+    // === КОНЕЦ НОВОГО КОДА ===
 
     // Геометрия прямоугольного экрана
     SimpleVertex vertices[] =
@@ -227,55 +301,120 @@ HRESULT InitDevice(HWND hwnd)
     return S_OK;
 }
 
-// Отрисовка кадра
+// Обновленная функция отрисовки (Двухпроходный конвейер рендеринга)
+// Обновленная функция отрисовки (Трехпроходный вычислительный конвейер)
 void Render()
 {
     if (g_pRenderTargetView == NULL) return;
 
-    float ClearColor[] = { 0.75f, 0.75f, 0.75f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColor);
-
+    // 1. Общие настройки сетки экрана (прямоугольник из 4 вершин)
     UINT stride = sizeof(SimpleVertex);
     UINT offset = 0;
     g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &stride, &offset);
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
 
-    g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
-    g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
-    
-    // === НОВЫЙ КОД: ОБНОВЛЯЕМ ПАРАМЕТРЫ КАДРА ДЛЯ ШЕЙДЕРОВ ===
+    // 2. Загружаем размеры и шаги пикселей в буфер констант для шейдеров
     ShaderConstants cbData;
-    cbData.width = 2.0f;                      // Наша тестовая текстура имеет ширину 2 пикселя
-    cbData.height = 2.0f;                     // И высоту 2 пикселя
-    cbData.d_width = 1.0f / cbData.width;     // Шаг одного пикселя по горизонтали (0.5)
-    cbData.d_height = 1.0f / cbData.height;   // Шаг одного пикселя по вертикали (0.5)
-
-    // Загружаем эти данные в буфер констант на видеокарте
+    cbData.width = 2.0f;
+    cbData.height = 2.0f;
+    cbData.d_width = 1.0f / cbData.width;
+    cbData.d_height = 1.0f / cbData.height;
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
 
-    // Привязываем буфер констант к пиксельному шейдеру в слот c0 (регистр c0)
+    // Общие привязки буфера констант и Point-сэмплера к конвейеру GPU
+    g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
-    // === КОНЕЦ НОВОГО КОДА ===
+    g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState);
 
+    // Системный пустой указатель для сброса текстурных слотов (защита от конфликтов чтения/записи)
+    ID3D11ShaderResourceView* nullSRV[] = { NULL };
+
+
+    // ========================================================================
+    // ПРОХОД 1: Скрытый анализ блоков 4х4 (3-й шейдер -> буфер Stage1)
+    // ========================================================================
+    float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pStage1RTV, ClearColorBlack);
+
+    // Направляем вывод в первый скрытый холст Stage1
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage1RTV, NULL);
+
+    // Включаем 3-й шейдер анализа блоков 4х4
+    g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
+
+    // Подаем на вход стартовую шахматную текстуру кадра 2х2 в слот t0
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-    g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState); // Связываем наш POINT-сэмплер
 
+    // Видеокарта рассчитывает первый этап статистики
     g_pImmediateContext->Draw(4, 0);
 
+
+    // ========================================================================
+    // ПРОХОД 2: Скрытый макроанализ 8х8 (4-й шейдер -> буфер Stage2)
+    // ========================================================================
+
+    // Освобождаем слот t0 перед переключением этапов
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+    g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearColorBlack);
+
+    // Переключаем вывод видеокарты на второй скрытый холст Stage2
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage2RTV, NULL);
+
+    // Включаем наш новый 4-й шейдер укрупненного анализа макроблоков 8х8
+    g_pImmediateContext->PSSetShader(g_pPixelShaderStage2, NULL, 0);
+
+    // Подаем ему на вход результаты первого этапа из буфера Stage1 в слот t0
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage1SRV);
+
+    // Видеокарта объединяет дисперсии независимых подвыборок
+    g_pImmediateContext->Draw(4, 0);
+
+
+    // ========================================================================
+    // ПРОХОД 3: Вывод финальной аналитики на экран монитора оператора
+    // ========================================================================
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+    // Очищаем реальный экран монитора в мягкий серый цвет
+    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
+
+    // Возвращаем вывод видеокарты обратно на реальный экран монитора
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
+
+    // Включаем на прорисовку экрана стандартный 3-й шейдер (он просто выведет данные Stage2 один в один)
+    g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
+
+    // Передаем на вход экрана скрытые укрупненные макроданные Stage2 в слот t0
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage2SRV);
+
+    // Видеокарта выводит финальные расчеты на монитор
+    g_pImmediateContext->Draw(4, 0);
+
+    // Полный сброс текстурного слота для чистоты конвейера перед следующим кадром
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+    // Выводим готовый кадр на экран монитора
     g_pSwapChain->Present(0, 0);
 }
 
-// Безопасное освобождение памяти
+// Безопасное освобождение памяти при выходе
 void CleanupDevice()
 {
     if (g_pImmediateContext) g_pImmediateContext->ClearState();
 
+    if (g_pStage1SRV) { g_pStage1SRV->Release(); g_pStage1SRV = NULL; }
+    if (g_pStage1RTV) { g_pStage1RTV->Release(); g_pStage1RTV = NULL; }
+    if (g_pStage2SRV) { g_pStage2SRV->Release(); g_pStage2SRV = NULL; } // НОВОЕ: Очистка ресурса чтения Stage2
+    if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; } // НОВОЕ: Очистка холста записи Stage2
     if (g_pSamplerState) { g_pSamplerState->Release(); g_pSamplerState = NULL; }
-    if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = NULL; } // НОВОЕ: Очистка буфера констант
+    if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = NULL; }
     if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
     if (g_pVertexBuffer) { g_pVertexBuffer->Release(); g_pVertexBuffer = NULL; }
     if (g_pVertexLayout) { g_pVertexLayout->Release(); g_pVertexLayout = NULL; }
     if (g_pPixelShader) { g_pPixelShader->Release(); g_pPixelShader = NULL; }
+    if (g_pPixelShaderStage2) { g_pPixelShaderStage2->Release(); g_pPixelShaderStage2 = NULL; } // НОВОЕ: Очистка 4-го шейдера анализа
     if (g_pVertexShader) { g_pVertexShader->Release(); g_pVertexShader = NULL; }
     if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = NULL; }

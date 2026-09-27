@@ -90,3 +90,48 @@ float4 PS(VS_OUTPUT input) : SV_Target
     // R = Среднее, G = Минимум, B = Максимум, A = Контраст
     return float4(GrayMid, GrayMin, GrayMax, GraySqr);
 }
+
+// Пиксельный шейдер: 4-й проход (Pass 2: Укрупненный анализ макроблоков 8х8)
+float4 PS_Stage2(VS_OUTPUT input) : SV_Target
+{
+    float Summ_mid = 0.0f; // Переменная для укрупненного среднего значения
+    float Summ_sqr = 0.0f; // Переменная для объединения дисперсий
+    float Summ_min = 1.0f; // Глобальный минимум среди блоков
+    float Summ_max = 0.0f; // Глобальный максимум среди блоков
+
+    float2 tex_coord;
+
+    // Цикл 2х2 для обхода четырех соседних блоков 4х4 (кластер 8х8 исходных пикселей)
+    [unroll]
+    for (int i_width = 0; i_width < 2; i_width++)
+    {
+        for (int i_height = 0; i_height < 2; i_height++)
+        {
+            // Сдвигаемся на шаг пикселя для выборки статистики соседнего блока
+            tex_coord.x = input.Tex.x + float(i_width) * d_width;
+            tex_coord.y = input.Tex.y + float(i_height) * d_height;
+
+            // Читаем RGBA-вектор статистики отдельного блока 4х4 из предыдущего прохода
+            float4 k1 = shaderTexture.Sample(samplerState0, tex_coord);
+
+            // Накапливаем укрупненное среднее значение
+            Summ_mid += k1.x; // k1.x — это среднее (GrayMid) из 3-го шейдера
+
+            // Находим глобальные минимум и максимум среди подвыборок
+            if (k1.y < Summ_min) Summ_min = k1.y; // k1.y — это минимум (GrayMin)
+            if (k1.z > Summ_max) Summ_max = k1.z; // k1.z — это максимум (GrayMax)
+
+            // Ваша магическая формула объединения дисперсий независимых подвыборок
+            Summ_sqr += k1.x * k1.x + k1.w * k1.w; // k1.w — это среднеквадратичное отклонение (GraySqr)
+        }
+    }
+
+    // Рассчитываем итоговое среднее для макроблока 8х8
+    Summ_mid /= 4.0f;
+
+    // Вычисляем математически точную дисперсию (контраст) для макроблока 8х8
+    Summ_sqr = sqrt(abs(Summ_sqr / 4.0f - Summ_mid * Summ_mid));
+
+    // Упаковываем укрупненную макроаналитику 8х8 в RGBA каналы пикселя
+    return float4(Summ_mid, Summ_min, Summ_max, Summ_sqr);
+}
