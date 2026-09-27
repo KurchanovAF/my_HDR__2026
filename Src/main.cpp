@@ -5,6 +5,17 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+// === НОВЫЙ КОД: ИДЕНТИФИКАТОРЫ ДЛЯ ВЕРХНЕГО МЕНЮ WINDOWS ===
+#define IDM_FILE_OPEN_VIDEO    1001  // Открыть видеофайл (AVI/MP4)
+#define IDM_FILE_OPEN_IMAGE    1002  // Открыть отдельное изображение (BMP/PNG)
+#define IDM_FILE_SAVE_RESULT   1003  // Записать преобразованный файл
+#define IDM_FILE_EXIT          1004  // Выход из программы
+
+#define IDM_VIEW_SPLIT         1005  // Режим "До / После" (разделение экрана)
+#define IDM_VIEW_RESULT_ONLY   1006  // Режим "Только результат"
+
+#define IDM_HELP_ABOUT         1007  // О программе
+
 // Структура вершины для нашего видеоэкрана
 struct SimpleVertex
 {
@@ -492,6 +503,39 @@ void CleanupDevice()
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = NULL; }
 }
 
+// === НОВЫЙ КОД: ФУНКЦИЯ СОЗДАНИЯ СИСТЕМНОГО МЕНЮ ===
+void CreateAppMenu(HWND hwnd)
+{
+    HMENU hMenu = CreateMenu();         // Главная горизонтальная полоса
+    HMENU hFileMenu = CreatePopupMenu(); // Выпадающее меню "Файл"
+    HMENU hViewMenu = CreatePopupMenu(); // Выпадающее меню "Вид"
+    HMENU hHelpMenu = CreatePopupMenu(); // Выпадающее меню "Справка"
+
+    // Заполняем меню "Файл"
+    AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_OPEN_VIDEO, L"Открыть видео поток (AVI/MP4)...");
+    AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_OPEN_IMAGE, L"Открыть кадр/картинку (BMP/PNG)...");
+    AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL); // Разделительная линия
+    AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_SAVE_RESULT, L"Записать преобразованный файл...");
+    AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_EXIT, L"Выход");
+
+    // Заполняем меню "Вид"
+    AppendMenuW(hViewMenu, MF_STRING | MF_CHECKED, IDM_VIEW_RESULT_ONLY, L"Только обработанный результат");
+    AppendMenuW(hViewMenu, MF_STRING, IDM_VIEW_SPLIT, L"Режим \"До / После\" (Разделение экрана)");
+
+    // Заполняем меню "Справка"
+    AppendMenuW(hHelpMenu, MF_STRING, IDM_HELP_ABOUT, L"О программе...");
+
+    // Прикрепляем выпадающие списки к главной полосе меню
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, L"Файл");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, L"Вид");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelpMenu, L"Справка");
+
+    // Физически вешаем меню на наше окно программы
+    SetMenu(hwnd, hMenu);
+}
+// === КОНЕЦ НОВОГО КОДА ===
+
 // Главная точка входа Windows-приложения
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow)
 {
@@ -508,6 +552,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
     if (hwnd == NULL) return 0;
     ShowWindow(hwnd, nCmdShow);
+
+    CreateAppMenu(hwnd); // НОВОЕ: Физически включаем меню на экране сразу после показа окна
 
     if (FAILED(InitDevice(hwnd)))
     {
@@ -539,6 +585,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
+        // === НОВЫЙ КОД: ОБРАБОТКА НАЖАТИЙ НА ПУНКТЫ МЕНЮ ===
+    case WM_COMMAND:
+        // В wParam система Windows передает ID нажатого пункта меню
+        switch (LOWORD(wParam))
+        {
+        case IDM_FILE_EXIT:
+            // Если нажали "Выход" — закрываем окно программы
+            DestroyWindow(hwnd);
+            return 0;
+
+        case IDM_HELP_ABOUT:
+            // Если нажали "О программе" — показываем красивое информационное окно
+            MessageBoxW(hwnd,
+                L"Шейдерный Видеоплеер-Дефектоскоп v2026\n\n"
+                L"Реализован пятипроходный вычислительный конвейер.\n"
+                L"Алгоритмы фильтрации локального контраста и дисперсии макроблоков 4х4 и 8х8.\n\n"
+                L"Разработчик математического ядра: Курчанов А. Ф.",
+                L"О программе",
+                MB_OK | MB_ICONINFORMATION);
+            return 0;
+
+        case IDM_FILE_OPEN_VIDEO:
+        case IDM_FILE_OPEN_IMAGE:
+        case IDM_FILE_SAVE_RESULT:
+        case IDM_VIEW_SPLIT:
+        case IDM_VIEW_RESULT_ONLY:
+            // Для остальных пунктов пока выведем временную заглушку, чтобы видеть отклик
+            MessageBoxW(hwnd, L"Этот блок конвейера находится в режиме подключения данных.", L"Информация", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        break;
+        // === КОНЕЦ НОВОГО КОДА ===
+
     case WM_SIZE:
         if (g_pSwapChain)
         {
