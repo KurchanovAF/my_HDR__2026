@@ -18,8 +18,12 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 0,
+          "SelectedChildIndex": 1,
           "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{cce594b6-0c39-4442-ba28-10c64ac7e89f}"
+            },
             {
               "$type": "Document",
               "DocumentIndex": 0,
@@ -28,7 +32,7 @@
               "RelativeDocumentMoniker": "Src\\main.cpp",
               "ToolTip": "D:\\YandexDisk\\Old_D2\\\u0410\u0420\u0425\u0418\u0412_E\\\u0410\u0440\u0445\u0438\u0432 \u043F\u043E \u0421\u041C\u041F\\27 \u0441\u0435\u043D\u0442\u044F\u0431\u0440\u044F 2026\\my_HDR__2026\\Src\\main.cpp",
               "RelativeToolTip": "Src\\main.cpp",
-              "ViewState": "AgIAAHIBAAAAAAAAAAAIwHsBAAA7AAAAAAAAAA==",
+              "ViewState": "AgIAALQBAAAAAAAAAAAIwMkBAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-09-27T13:45:24.523Z",
               "EditorCaption": ""
@@ -41,9 +45,10 @@
               "RelativeDocumentMoniker": "shaders.hlsl",
               "ToolTip": "D:\\YandexDisk\\Old_D2\\\u0410\u0420\u0425\u0418\u0412_E\\\u0410\u0440\u0445\u0438\u0432 \u043F\u043E \u0421\u041C\u041F\\27 \u0441\u0435\u043D\u0442\u044F\u0431\u0440\u044F 2026\\my_HDR__2026\\shaders.hlsl",
               "RelativeToolTip": "shaders.hlsl",
-              "ViewState": "AgIAAGkAAAAAAAAAAAAuwIkAAAAAAAAAAAAAAA==",
+              "ViewState": "AgIAAJEAAAAAAAAAAAAiwK8AAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-09-27T12:18:03.24Z"
+              "WhenOpened": "2026-09-27T12:18:03.24Z",
+              "EditorCaption": ""
             }
           ]
         }

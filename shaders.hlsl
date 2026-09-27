@@ -135,3 +135,41 @@ float4 PS_Stage2(VS_OUTPUT input) : SV_Target
     // Упаковываем укрупненную макроаналитику 8х8 в RGBA каналы пикселя
     return float4(Summ_mid, Summ_min, Summ_max, Summ_sqr);
 }
+
+// Пиксельный шейдер: 5-й проход (Pass 3: Фильтрация и адаптивное сжатие контрастности)
+float4 PS_Stage3(VS_OUTPUT input) : SV_Target
+{
+    // 1. Считываем исходный "сырой" пиксель кадра (из оригинальной текстуры)
+    float4 src_color = shaderTexture.Sample(samplerState0, input.Tex);
+    float src_gray = dot(src_color.rgb, WEIGHT);
+
+    // 2. Считываем вектор макростатистики 8х8, который мы посчитали в прошлый раз
+    // (Он придет к нам на этом проходе через промежуточный буфер)
+    float4 stats = shaderTexture.Sample(samplerState0, input.Tex);
+    float macro_mid = stats.x; // Укрупненное среднее по макроблоку
+    float macro_min = stats.y; // Минимум в макроблоке
+    float macro_max = stats.z; // Максимум в макроблоке
+    float macro_sqr = stats.w; // Дисперсия (локальный контраст) макроблока 8х8
+
+    // 3. Ваша базовая математика адаптивного сжатия динамического диапазона (HDR-фильтр):
+    // Находим отклонение текущего пикселя от среднего уровня его макроблока
+    float delta = src_gray - macro_mid;
+
+    // Защитный коэффициент от деления на ноль, который мы закладывали в 2011 году
+    float denom = (macro_max - macro_min) + 0.001f;
+
+    // Нормализуем локальный контраст внутри макроблока
+    float local_contrast = delta / denom;
+
+    // Адаптивно прижимаем глобальную яркость, но при этом УСИЛИВАЕМ локальные микродетали!
+    // (Умножаем локальный контраст на дисперсию macro_sqr, чтобы вытащить скрытые контуры контура на УЗИ/рентгене)
+    float out_gray = macro_mid + local_contrast * (macro_sqr * 2.0f);
+
+    // Удерживаем итоговую яркость строго в системных рамках от 0.0 (черный) до 1.0 (белый)
+    out_gray = saturate(out_gray);
+
+    // Переносим рассчитанную попиксельную яркость в финальный RGBA цвет кадра
+    float4 final_color = float4(out_gray, out_gray, out_gray, 1.0f);
+
+    return final_color;
+}
