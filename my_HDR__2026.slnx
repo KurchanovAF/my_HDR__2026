@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="my_HDR__2026.vcxproj" />
+  <Project Path="my_HDR__2026.vcxproj" Id="ed8936df-e555-4219-a5c7-3245ed41bea9" />
 </Solution>

@@ -22,4 +22,7 @@
   <ItemGroup>
     <Text Include="shaders.hlsl" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include=".gitignore" />
+  </ItemGroup>
 </Project>

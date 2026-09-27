@@ -1,0 +1,13 @@
+﻿.vs/
+[Bb]in/
+[Xx]64/
+[Dd]ebug/
+[Rr]elease/
+*.obj
+*.pdb
+*.log
+*.tlog
+*.lastbuildstate
+*.idb
+*.ilk
+*.exe
