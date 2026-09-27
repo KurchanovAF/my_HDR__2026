@@ -173,3 +173,25 @@ float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 
     return final_color;
 }
+
+// Пиксельный шейдер: 6-й проход (Pass 4: Финальная цветокоррекция и гамма-коррекция кадра)
+float4 PS_Final(VS_OUTPUT input) : SV_Target
+{
+    // 1. Считываем отфильтрованный пиксель яркости из буфера Stage3
+    float4 color_stage3 = shaderTexture.Sample(samplerState0, input.Tex);
+    float gray = color_stage3.x; // Берем рассчитанную яркость
+
+    // 2. Ваша финальная математика цветокоррекции:
+    // Применяем классическую гамма-коррекцию (например, pow(gray, 1.0 / 2.2) для осветления теней)
+    // В рентгеновском контроле и УЗИ это позволяет глазу оператора лучше различать градации серого
+    float corrected_gray = pow(abs(gray), 1.0f / 2.2f);
+
+    // Добавляем небольшой искусственный микроконтраст на основе локального уровня
+    corrected_gray = corrected_gray * 1.05f - 0.02f;
+
+    // Защищаем значения цвета от выхода за границы [0.0 ... 1.0]
+    corrected_gray = saturate(corrected_gray);
+
+    // Сборка финального кадра для вывода на экран монитора оператора
+    return float4(corrected_gray, corrected_gray, corrected_gray, 1.0f);
+}

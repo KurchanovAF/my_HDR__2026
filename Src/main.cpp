@@ -44,10 +44,9 @@ ID3D11RenderTargetView* g_pRenderTargetView = NULL; // Окно вывода
 
 ID3D11VertexShader* g_pVertexShader = NULL;     // Вершинный шейдер
 ID3D11PixelShader* g_pPixelShader = NULL;      // Пиксельный шейдер
-
 ID3D11PixelShader* g_pPixelShaderStage2 = NULL; // НОВОЕ: Указатель на 4-й шейдер анализа макроблоков 8х8
-
 ID3D11PixelShader* g_pPixelShaderStage3 = NULL; // НОВОЕ: Указатель на 5-й шейдер адаптивной фильтрации контраста
+ID3D11PixelShader* g_pPixelShaderFinal = NULL;  // НОВОЕ: Указатель на 6-й шейдер финальной цветокоррекции и гаммы
 
 ID3D11InputLayout* g_pVertexLayout = NULL;     // Формат вершин
 ID3D11Buffer* g_pVertexBuffer = NULL;     // Буфер геометрии
@@ -185,6 +184,17 @@ HRESULT InitDevice(HWND hwnd)
 
     hr = g_pd3dDevice->CreatePixelShader(pPSStage3Blob->GetBufferPointer(), pPSStage3Blob->GetBufferSize(), NULL, &g_pPixelShaderStage3);
     pPSStage3Blob->Release(); // Освобождаем память временного буфера компиляции
+    if (FAILED(hr)) return hr;
+    // === КОНЕЦ НОВОГО КОДА ===
+
+        // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 6-ГО ШЕЙДЕРА (FINAL) ===
+    ID3DBlob* pPSFinalBlob = NULL;
+    // Указываем точку входа "PS_Final" — строго как имя функции в файле shaders.hlsl
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Final", "ps_4_0", &pPSFinalBlob);
+    if (FAILED(hr)) return hr;
+
+    hr = g_pd3dDevice->CreatePixelShader(pPSFinalBlob->GetBufferPointer(), pPSFinalBlob->GetBufferSize(), NULL, &g_pPixelShaderFinal);
+    pPSFinalBlob->Release(); // Освобождаем память временного буфера компиляции
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
@@ -341,6 +351,7 @@ HRESULT InitDevice(HWND hwnd)
 // Обновленная функция отрисовки (Двухпроходный конвейер рендеринга)
 // Обновленная функция отрисовки (Трехпроходный вычислительный конвейер)
 // Обновленная функция отрисовки (Четырехпроходный вычислительный конвейер)
+// Финальная функция отрисовки (Пятипроходный вычислительный конвейер)
 void Render()
 {
     if (g_pRenderTargetView == NULL) return;
@@ -391,8 +402,6 @@ void Render()
     // ========================================================================
     // ПРОХОД 2: Скрытый макроанализ 8х8 (4-й шейдер -> буфер Stage2)
     // ========================================================================
-
-    // Освобождаем слот t0 перед переключением этапов
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearColorBlack);
 
@@ -418,18 +427,18 @@ void Render()
     // Переключаем вывод видеокарты на третий скрытый холст Stage3
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
 
-    // Включаем наш новый 5-й шейдер фильтрации контрастности
+    // Включаем 5-й шейдер фильтрации контрастности
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
 
     // Подаем ему на вход укрупненную макростатистику из буфера Stage2 в слот t0
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage2SRV);
 
-    // Видеокарта выполняет HDR-фильтрацию контраста по вашей формуле
+    // Видеокарта выполняет HDR-фильтрацию контраста
     g_pImmediateContext->Draw(4, 0);
 
 
     // ========================================================================
-    // ПРОХОД 4: Вывод финальной отфильтрованной картинки на экран оператора
+    // ПРОХОД 4-5: Финальная цветокоррекция и вывод на реальный экран монитора
     // ========================================================================
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
 
@@ -440,10 +449,10 @@ void Render()
     // Возвращаем вывод видеокарты обратно на реальный экран монитора
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
 
-    // Включаем на прорисовку экрана стандартный 3-й шейдер (он просто выведет данные Stage3 один в один)
-    g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
+    // Включаем на прорисовку экрана наш новый 6-й шейдер (гамма-коррекция и финальный штрих)
+    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
 
-    // Передаем на вход экрана скрытые отфильтрованные данные Stage3 в слот t0
+    // Передаем на вход экрана отфильтрованные данные Stage3 в слот t0
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage3SRV);
 
     // Видеокарта выводит финальный результат на монитор
@@ -452,7 +461,7 @@ void Render()
     // Полный сброс текстурного слота для чистоты конвейера перед следующим кадром
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
 
-    // Выводим готовый кадр на экран монитора
+    // Выводим готовый кадр на экран монитора оператора
     g_pSwapChain->Present(0, 0);
 }
 
@@ -475,6 +484,7 @@ void CleanupDevice()
     if (g_pPixelShader) { g_pPixelShader->Release(); g_pPixelShader = NULL; }
     if (g_pPixelShaderStage2) { g_pPixelShaderStage2->Release(); g_pPixelShaderStage2 = NULL; } // НОВОЕ: Очистка 4-го шейдера анализа
     if (g_pPixelShaderStage3) { g_pPixelShaderStage3->Release(); g_pPixelShaderStage3 = NULL; } // НОВОЕ: Очистка 5-го шейдера фильтрации
+    if (g_pPixelShaderFinal) { g_pPixelShaderFinal->Release(); g_pPixelShaderFinal = NULL; } // НОВОЕ: Очистка 6-го шейдера цветокоррекции
     if (g_pVertexShader) { g_pVertexShader->Release(); g_pVertexShader = NULL; }
     if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = NULL; }
