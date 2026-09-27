@@ -47,6 +47,9 @@ ID3D11ShaderResourceView* g_pStage2SRV = NULL; // Ссылка на макроа
 ID3D11RenderTargetView* g_pStage3RTV = NULL; // Холст для записи HDR-фильтра
 ID3D11ShaderResourceView* g_pStage3SRV = NULL; // Ссылка на этот результат
 
+// === НОВЫЙ КОД: ПЕРЕМЕННАЯ ДЛЯ ХРАНЕНИЯ ПУТИ К ОТКРЫТОМУ ФАЙЛУ ===
+wchar_t                   g_szSelectedFilePath[MAX_PATH] = L""; // Буфер для пути к картинке или видео
+
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (СТРОГО ПО ОДНОМУ ЭКЗЕМПЛЯРУ): ---
 ID3D11Device* g_pd3dDevice = NULL;        // Видеокарта
 ID3D11DeviceContext* g_pImmediateContext = NULL; // Контекст команд
@@ -536,6 +539,44 @@ void CreateAppMenu(HWND hwnd)
 }
 // === КОНЕЦ НОВОГО КОДА ===
 
+// === НОВЫЙ КОД: ФУНКЦИЯ ВЫЗОВА СИСТЕМНОГО ПРОВОДНИКА WINDOWS ===
+bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
+{
+    OPENFILENAMEW ofn = {};
+    wchar_t szFile[MAX_PATH] = L"";
+
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile) / sizeof(szFile[0]);
+
+    if (bOpenVideo)
+    {
+        // Фильтр файлов для видеопотока
+        ofn.lpstrFilter = L"Видео файлы (AVI, MP4)\0*.avi;*.mp4\0Все файлы (*.*)\0*.*\0";
+        ofn.lpstrTitle = L"Выберите видео поток для дефектоскопа";
+    }
+    else
+    {
+        // Фильтр файлов для отдельных изображений
+        ofn.lpstrFilter = L"Изображения (BMP, PNG)\0*.bmp;*.png\0Все файлы (*.*)\0*.*\0";
+        ofn.lpstrTitle = L"Выберите кадр/картинку для анализа";
+    }
+
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    // Распахиваем системное окно Проводника
+    if (GetOpenFileNameW(&ofn))
+    {
+        // Если пользователь выбрал файл и нажал "Открыть" — копируем путь в нашу глобальную переменную
+        wcscpy_s(g_szSelectedFilePath, MAX_PATH, ofn.lpstrFile);
+        return true;
+    }
+
+    return false; // Если пользователь нажал "Отмена"
+}
+// === КОНЕЦ НОВОГО КОДА ===
+
 // Главная точка входа Windows-приложения
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow)
 {
@@ -607,7 +648,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case IDM_FILE_OPEN_VIDEO:
+            // Вызываем Проводник в режиме фильтрации видео (передаем true)
+            if (OpenFileDialog(hwnd, true))
+            {
+                // Если файл выбран успешно — выведем его путь на экран для проверки
+                MessageBoxW(hwnd, g_szSelectedFilePath, L"Видео поток успешно подключен", MB_OK | MB_ICONINFORMATION);
+
+                // TODO: Здесь на следующем шаге мы запустим инициализацию Media Foundation
+            }
+            return 0;
+
         case IDM_FILE_OPEN_IMAGE:
+            // Вызываем Проводник в режиме фильтрации картинок (передаем false)
+            if (OpenFileDialog(hwnd, false))
+            {
+                // Если картинка выбрана успешно — выведем её путь на экран для проверки
+                MessageBoxW(hwnd, g_szSelectedFilePath, L"Кадр изображения успешно подключен", MB_OK | MB_ICONINFORMATION);
+
+                // TODO: Здесь на следующем шаге мы запустим загрузчик картинок WIC
+            }
+            return 0;
+
         case IDM_FILE_SAVE_RESULT:
         case IDM_VIEW_SPLIT:
         case IDM_VIEW_RESULT_ONLY:
