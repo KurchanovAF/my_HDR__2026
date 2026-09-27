@@ -377,7 +377,7 @@ void Render()
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
 
     // Очищаем реальный экран монитора в мягкий серый цвет
-    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
+    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f }; 
     g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
 
     // Возвращаем вывод видеокарты обратно на реальный экран монитора
