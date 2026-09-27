@@ -377,13 +377,32 @@ void Render()
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
 
-    // 2. Загружаем размеры и шаги пикселей в буфер констант для шейдеров
+    // 2. Динамически запрашиваем у видеокарты физические размеры текущей активной текстуры
     ShaderConstants cbData;
-    cbData.width = 2.0f;
+    cbData.width = 2.0f;  // Значения по умолчанию, если файл не выбран
     cbData.height = 2.0f;
+
+    if (g_pTextureSRV)
+    {
+        ID3D11Resource* pResource = NULL;
+        g_pTextureSRV->GetResource(&pResource);
+        if (pResource)
+        {
+            ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pResource;
+            D3D11_TEXTURE2D_DESC desc;
+            pTex2D->GetDesc(&desc);
+
+            cbData.width = (float)desc.Width;   // Подставляем реальную ширину открытого файла
+            cbData.height = (float)desc.Height; // Подставляем реальную высоту открытого файла
+            pResource->Release();
+        }
+    }
+
+    // Рассчитываем точный шаг пикселя для ваших циклов анализа 4х4 и 8х8
     cbData.d_width = 1.0f / cbData.width;
     cbData.d_height = 1.0f / cbData.height;
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
+
 
     // Общие привязки буфера констант и Point-сэмплера к конвейеру GPU
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
@@ -539,6 +558,127 @@ void CreateAppMenu(HWND hwnd)
 }
 // === КОНЕЦ НОВОГО КОДА ===
 
+#include <wincodec.h> // Подключаем заголовки системного декодера WIC
+
+// === НОВЫЙ КОД: БЕЗОПАСНАЯ ЗАГРУЗКА ЛЮБЫХ КАРТИНОК ЧЕРЕЗ WIC НА ВИДЕОКАРТУ ===
+HRESULT LoadTextureFromFile(const WCHAR* szFileName)
+{
+    HRESULT hr = S_OK;
+
+    // 1. Создаем фабрику декодеров WIC
+    IWICImagingFactory* pWICFactory = NULL;
+    hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (LPVOID*)&pWICFactory);
+    if (FAILED(hr)) return hr;
+
+    // 2. Открываем файл картинки на диске
+    IWICBitmapDecoder* pDecoder = NULL;
+    hr = pWICFactory->CreateDecoderFromFilename(szFileName, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &pDecoder);
+    if (FAILED(hr)) { pWICFactory->Release(); return hr; }
+
+    // 3. Берем самый первый кадр из файла (для BMP/PNG он один)
+    IWICBitmapFrameDecode* pFrame = NULL;
+    hr = pDecoder->GetFrame(0, &pFrame);
+    if (FAILED(hr)) { pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    // 4. Принудительно конвертируем пиксели в стандартный формат Direct3D 11 (RGBA 32-бит)
+    IWICFormatConverter* pConverter = NULL;
+    hr = pWICFactory->CreateFormatConverter(&pConverter);
+    if (FAILED(hr)) { pFrame->Release(); pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    hr = pConverter->Initialize(pFrame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0f, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) { pConverter->Release(); pFrame->Release(); pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    // 5. Узнаем физические размеры загруженной картинки
+    UINT imgWidth = 0, imgHeight = 0;
+    pConverter->GetSize(&imgWidth, &imgHeight);
+
+    // Выделяем временный буфер в оперативной памяти компьютера под пиксели
+    UINT* pPixelsBuffer = new UINT[imgWidth * imgHeight];
+    hr = pConverter->CopyPixels(NULL, imgWidth * sizeof(UINT), imgWidth * imgHeight * sizeof(UINT), (BYTE*)pPixelsBuffer);
+
+    if (SUCCEEDED(hr))
+    {
+        // 6. Если старая текстура уже была в памяти — чисто освобождаем её ресурсы перед перезаписью!
+        if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
+
+        // 7. Создаем новую текстуру прямо в видеопамяти под размеры нашей картинки
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = imgWidth;
+        desc.Height = imgHeight;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // Тот самый формат, под который настроен 3-й шейдер
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = pPixelsBuffer;
+        initData.SysMemPitch = imgWidth * sizeof(UINT);
+
+        ID3D11Texture2D* pTexture = NULL;
+        hr = g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
+        if (SUCCEEDED(hr))
+        {
+            // Создаем ресурс чтения для шейдеров плеера
+            hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
+            pTexture->Release();
+
+            // 1. Чисто освобождаем старые буферы из видеопамяти
+            if (g_pStage1RTV) { g_pStage1RTV->Release(); g_pStage1RTV = NULL; }
+            if (g_pStage1SRV) { g_pStage1SRV->Release(); g_pStage1SRV = NULL; }
+            if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; }
+            if (g_pStage2SRV) { g_pStage2SRV->Release(); g_pStage2SRV = NULL; }
+            if (g_pStage3RTV) { g_pStage3RTV->Release(); g_pStage3RTV = NULL; }
+            if (g_pStage3SRV) { g_pStage3SRV->Release(); g_pStage3SRV = NULL; }
+
+            // 2. Описываем параметры для новых скрытых холстов
+            D3D11_TEXTURE2D_DESC stageDesc = {};
+            stageDesc.Width = imgWidth;   // Физическая ширина открытого файла
+            stageDesc.Height = imgHeight; // Физическая высота открытого файла
+            stageDesc.MipLevels = 1;
+            stageDesc.ArraySize = 1;
+            stageDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stageDesc.SampleDesc.Count = 1;
+            stageDesc.Usage = D3D11_USAGE_DEFAULT;
+            stageDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+            // Создаем и привязываем Stage 1
+            ID3D11Texture2D* pTexS1 = NULL;
+            if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&stageDesc, NULL, &pTexS1))) {
+                g_pd3dDevice->CreateRenderTargetView(pTexS1, NULL, &g_pStage1RTV);
+                g_pd3dDevice->CreateShaderResourceView(pTexS1, NULL, &g_pStage1SRV);
+                pTexS1->Release();
+            }
+
+            // Создаем и привязываем Stage 2
+            ID3D11Texture2D* pTexS2 = NULL;
+            if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&stageDesc, NULL, &pTexS2))) {
+                g_pd3dDevice->CreateRenderTargetView(pTexS2, NULL, &g_pStage2RTV);
+                g_pd3dDevice->CreateShaderResourceView(pTexS2, NULL, &g_pStage2SRV);
+                pTexS2->Release();
+            }
+
+            // Создаем и привязываем Stage 3
+            ID3D11Texture2D* pTexS3 = NULL;
+            if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&stageDesc, NULL, &pTexS3))) {
+                g_pd3dDevice->CreateRenderTargetView(pTexS3, NULL, &g_pStage3RTV);
+                g_pd3dDevice->CreateShaderResourceView(pTexS3, NULL, &g_pStage3SRV);
+                pTexS3->Release();
+            }
+        }
+    }
+
+    // === ЗОЛОТОЕ ПРАВИЛО: СТРОЖАЙШЕ И ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ! ===
+    delete[] pPixelsBuffer; // Удаляем временный массив пикселей из ОЗУ
+    pConverter->Release();   // Закрываем конвертер WIC
+    pFrame->Release();       // Освобождаем кадр
+    pDecoder->Release();     // Закрываем файл на диске намертво!
+    pWICFactory->Release();  // Уничтожаем фабрику декодеров
+
+    return hr;
+}
+
 // === НОВЫЙ КОД: ФУНКЦИЯ ВЫЗОВА СИСТЕМНОГО ПРОВОДНИКА WINDOWS ===
 bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
 {
@@ -580,6 +720,9 @@ bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
 // Главная точка входа Windows-приложения
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow)
 {
+    // === НОВЫЙ КОД: ИНИЦИАЛИЗАЦИЯ СИСТЕМНОЙ БИБЛИОТЕКИ COM ДЛЯ ДВИЖКА WIC ===
+    (void)CoInitializeEx(NULL, COINIT_APARTMENTTHREADED); // Запускает поддержку WIC в Windows
+
     const wchar_t CLASS_NAME[] = L"MyVideoPlayerWindowClass";
     WNDCLASS wc = { };
     wc.lpfnWndProc = WindowProc;
@@ -599,6 +742,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     if (FAILED(InitDevice(hwnd)))
     {
         CleanupDevice();
+        CoUninitialize(); // НОВОЕ: Чисто закрываем и освобождаем ресурсы COM-потока перед выходом!
         return 0;
     }
 
@@ -617,6 +761,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     }
 
     CleanupDevice();
+    CoUninitialize(); // НОВОЕ: Чисто закрываем и освобождаем ресурсы COM-потока перед выходом!
     return 0;
 }
 
@@ -659,15 +804,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case IDM_FILE_OPEN_IMAGE:
-            // Вызываем Проводник в режиме фильтрации картинок (передаем false)
+            // 1. Распахиваем Проводник для выбора картинки
             if (OpenFileDialog(hwnd, false))
             {
-                // Если картинка выбрана успешно — выведем её путь на экран для проверки
-                MessageBoxW(hwnd, g_szSelectedFilePath, L"Кадр изображения успешно подключен", MB_OK | MB_ICONINFORMATION);
-
-                // TODO: Здесь на следующем шаге мы запустим загрузчик картинок WIC
+                // 2. Если файл выбран — загружаем его пиксели в Point-текстуру через WIC
+                if (SUCCEEDED(LoadTextureFromFile(g_szSelectedFilePath)))
+                {
+                    // 3. 
+                    // Принудительно вызываем Render прямо сейчас, 
+                    // чтобы протолкнуть новые SRV-интерфейсы в GPU!
+                    Render();
+                }
+                else
+                {
+                    MessageBoxW(hwnd, L"Не удалось декодировать файл изображения через WIC.", L"Ошибка дефектоскопа", MB_OK | MB_ICONERROR);
+                }
             }
             return 0;
+
 
         case IDM_FILE_SAVE_RESULT:
         case IDM_VIEW_SPLIT:
