@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <cmath> // ИСПРАВЛЕНИЕ: Подключили математические функции sqrt и pow для CPU
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -15,6 +16,14 @@
 #define IDM_VIEW_RESULT_ONLY   1006  // Режим "Только результат"
 
 #define IDM_HELP_ABOUT         1007  // О программе
+#define IDM_VIEW_CPU           40003
+// Идентификаторы для дискретных масштабов дефектоскопа
+#define IDM_ZOOM_FIT   40010
+#define IDM_ZOOM_1     40011
+#define IDM_ZOOM_2     40012
+#define IDM_ZOOM_4     40013
+#define IDM_ZOOM_8     40014
+#define IDM_ZOOM_16    40015
 
 // Структура вершины для нашего видеоэкрана
 struct SimpleVertex
@@ -32,6 +41,9 @@ struct ShaderConstants
     float d_height;  // Шаг одного пикселя по вертикали (1.0 / height)
 };
 
+// Прототип функции программной фильтрации на центральном процессоре
+HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixels);
+
 // Глобальный указатель на буфер констант
 ID3D11Buffer* g_pConstantBuffer = NULL;
 
@@ -46,6 +58,54 @@ ID3D11ShaderResourceView* g_pStage2SRV = NULL; // Ссылка на макроа
 // ОБЪЕКТЫ ДЛЯ ФИЛЬТРА ГЛОБАЛЬНОЙ КОНТРАСТНОСТИ (5-Й ШЕЙДЕР)
 ID3D11RenderTargetView* g_pStage3RTV = NULL; // Холст для записи HDR-фильтра
 ID3D11ShaderResourceView* g_pStage3SRV = NULL; // Ссылка на этот результат
+
+// === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
+ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
+
+// Стадия 1:2
+ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
+ID3D11ShaderResourceView* g_pStageDown2SRV = NULL;
+
+// Стадия 1:4
+ID3D11RenderTargetView* g_pStageDown4RTV = NULL;
+ID3D11ShaderResourceView* g_pStageDown4SRV = NULL;
+
+// Стадия 1:8
+ID3D11RenderTargetView* g_pStageDown8RTV = NULL;
+ID3D11ShaderResourceView* g_pStageDown8SRV = NULL;
+
+// Стадия 1:16
+ID3D11RenderTargetView* g_pStageDown16RTV = NULL;
+ID3D11ShaderResourceView* g_pStageDown16SRV = NULL;
+
+// === НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПРОГРАММНОГО РЕЖИМА (CPU) ===
+bool                      g_bUseCPUProcessing = false; // true - процессор, false - видеокарта
+ID3D11Texture2D* g_pCpuTexture = NULL;        // Промежуточный холст для пикселей от CPU
+ID3D11ShaderResourceView* g_pCpuTextureSRV = NULL;     // Ресурс чтения результата CPU для шторки
+
+// === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
+int                       g_scrollX = 0; // Текущий сдвиг картинки по горизонтали в пикселях
+int                       g_scrollY = 0; // Текущий сдвиг картинки по вертикали в пикселях
+UINT                      g_currentImgWidth = 0;  // Храним размеры текущего файла
+UINT                      g_currentImgHeight = 0;
+
+// === ГЛОБАЛЬНЫЕ РАЗМЕРЫ КЛИЕНТСКОЙ ОБЛАСТИ ОКНА ===
+float                     g_wndW = 800.0f; // Стартовая ширина окна по умолчанию
+float                     g_wndH = 600.0f; // Стартовая высота окна по умолчанию
+
+// === ГЛОБАЛЬНЫЕ ДОЛИ ПРОКРУТКИ КАДРА (ОТ 0.0 ДО 1.0) ===
+float                     g_scrollRatioX = 0.0f;
+float                     g_scrollRatioY = 0.0f;
+
+// Глобальный делитель масштаба кадра
+float                     g_zoomDivider = 1.0f;
+
+// Глобальный флаг режима автоматического вписывания картинки в окно
+bool                      g_bFitToWindow = true; // По умолчанию плеер стартует в режиме "Вписать в кадр"!
+
+// === ГЛОБАЛЬНЫЕ МАСШТАБНЫЕ МНОЖИТЕЛИ ДЛЯ ИДЕАЛЬНОГО СКРОЛЛИНГА ===
+float                     g_scrollMultiplierX = 1.0f;
+float                     g_scrollMultiplierY = 1.0f;
 
 // === НОВЫЙ КОД: ПЕРЕМЕННАЯ ДЛЯ ХРАНЕНИЯ ПУТИ К ОТКРЫТОМУ ФАЙЛУ ===
 wchar_t                   g_szSelectedFilePath[MAX_PATH] = L""; // Буфер для пути к картинке или видео
@@ -193,6 +253,14 @@ HRESULT InitDevice(HWND hwnd)
 
     hr = g_pd3dDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), NULL, &g_pPixelShader);
     pPSBlob->Release();
+    if (FAILED(hr)) return hr;
+
+    // === КОМПИЛЯЦИЯ НОВОГО ШЕЙДЕРА ПИРАМИДАЛЬНОГО СЖАТИЯ ===
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Downsample2X", "ps_4_0", &pBlob);
+    if (FAILED(hr)) return hr;
+
+    hr = g_pd3dDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), NULL, &g_pPixelShaderDownsample);
+    pBlob->Release();
     if (FAILED(hr)) return hr;
 
     // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 4-ГО ШЕЙДЕРА (STAGE 2) ===
@@ -353,14 +421,14 @@ HRESULT InitDevice(HWND hwnd)
         pStage3Tex->Release(); // Передаем управление текстурой видеокарте
     }
     if (FAILED(hr)) return hr;
-
-    // Геометрия прямоугольного экрана
+    
+    // Геометрия прямоугольного экрана по умолчанию (стартовая)
     SimpleVertex vertices[] =
     {
-        { { -1.0f,  1.0f, 0.0f },     { 0.0f, 0.0f } },
-        { {  1.0f,  1.0f, 0.0f },     { 1.0f, 0.0f } },
-        { { -1.0f, -1.0f, 0.0f },     { 0.0f, 1.0f } },
-        { {  1.0f, -1.0f, 0.0f },     { 1.0f, 1.0f } },
+    { { -1.0f,  1.0f, 0.0f },{ 0.0f, 0.0f } },
+    { { 1.0f,  1.0f, 0.0f },{ 1.0f, 0.0f } },
+    { { -1.0f, -1.0f, 0.0f },{ 0.0f, 1.0f } },
+    { { 1.0f, -1.0f, 0.0f },{ 1.0f, 1.0f } },
     };
 
     D3D11_BUFFER_DESC bd = {};
@@ -384,41 +452,118 @@ HRESULT InitDevice(HWND hwnd)
 // Финальная функция отрисовки (Пятипроходный вычислительный конвейер)
 // ПОЛНОЦЕННАЯ СИНХРОНИЗИРОВАННАЯ ФУНКЦИЯ ОТРИСОВКИ (ПЯТИПРОХОДНЫЙ КОНВЕЙЕР)
 // ПРЯМОЙ СКВОЗНОЙ КОНВЕЙЕР: ИСКЛЮЧАЕТ ЛЮБЫЕ БЛОКИРОВКИ ТЕКСТУР В ПАМЯТИ
+// ПОЛНОЦЕННАЯ СИНХРОНИЗИРОВАННАЯ ФУНКЦИЯ ОТРИСОВКИ С АВТОМАТИЧЕСКИМ СКРОЛЛИНГОМ И СОХРАНЕНИЕМ ПРОПОРЦИЙ
+// УТРЕННЯЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ С УМНЫМ ПОРТОМ ПРОСМОТРА
+// ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
 void Render()
 {
-    if (g_pRenderTargetView == NULL) return;
+    if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL) return;
 
-    // 1. Настройки сетки экрана
+    // 1. Общие настройки сетки экрана
     UINT stride = sizeof(SimpleVertex);
     UINT offset = 0;
     g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &stride, &offset);
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
 
-    // 2. Динамически запрашиваем у видеокарты физические размеры кадра
+    // 2. Запрашиваем физические размеры кадра
     ShaderConstants cbData;
     cbData.width = 0.0f;
     cbData.height = 0.0f;
 
-    if (g_pTextureSRV)
+    ID3D11Resource* pResource = NULL;
+    g_pTextureSRV->GetResource(&pResource);
+    if (pResource)
     {
-        ID3D11Resource* pResource = NULL;
-        g_pTextureSRV->GetResource(&pResource);
-        if (pResource)
-        {
-            ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pResource;
-            D3D11_TEXTURE2D_DESC desc;
-            pTex2D->GetDesc(&desc);
-            cbData.width = (float)desc.Width;
-            cbData.height = (float)desc.Height;
-            pResource->Release();
-        }
+        ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pResource;
+        D3D11_TEXTURE2D_DESC desc;
+        pTex2D->GetDesc(&desc);
+        cbData.width = (float)desc.Width;
+        cbData.height = (float)desc.Height;
+        pResource->Release();
     }
 
+    float originalFileW = cbData.width;
+    float originalFileH = cbData.height;
+
+    // Расчет шагов пикселя для промежуточных аналитических этапов (всегда в полный размер кадра!)
     cbData.d_width = (cbData.width > 0.0f) ? (1.0f / cbData.width) : 0.0f;
     cbData.d_height = (cbData.height > 0.0f) ? (1.0f / cbData.height) : 0.0f;
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
 
+    // === ЖЕЛЕЗОБЕТОННАЯ МАТЕМАТИКА КОНВЕЙЕРА: ВПИСЫВАНИЕ И МАСШТАБЫ ПИКСЕЛЬ В ПИКСЕЛЬ ===
+
+// 1. Стартовые текстурные координаты (вся картинка целиком)
+    float tLeft = 0.0f, tRight = 1.0f, tTop = 0.0f, tBottom = 1.0f;
+    // Стартовые геометрические рамки квада на экране (на все окно от -1.0 до +1.0)
+    float screenLeft = -1.0f, screenRight = 1.0f, screenTop = 1.0f, screenBottom = -1.0f;
+
+    if (originalFileW > 0.0f && originalFileH > 0.0f)
+    {
+        // --------------------------------------------------------------------
+        // ВАРИАНТ А: Режим "Вписать в кадр" (Автоматическое ужимание под размеры окна)
+        // --------------------------------------------------------------------
+        if (g_bFitToWindow)
+        {
+            // Вычисляем коэффициенты пропорций, чтобы лица не растягивались в "чудовище"!
+            float ratioW = g_wndW / originalFileW;
+            float ratioH = g_wndH / originalFileH;
+            float minRatio = (ratioW < ratioH) ? ratioW : ratioH;
+
+            float fitWidth = originalFileW * minRatio;
+            float fitHeight = originalFileH * minRatio;
+
+            // Сжимаем геометрические рамки квада строго под пропорции кадра, оставляя серое поле!
+            screenRight = -1.0f + 2.0f * (fitWidth / g_wndW);
+            screenBottom = 1.0f - 2.0f * (fitHeight / g_wndH);
+        }
+        // --------------------------------------------------------------------
+        // ВАРИАНТ Б: Честная дискретная масштабная сетка (1:1, 1:2, 1:4, 1:8, 1:16)
+        // --------------------------------------------------------------------
+        else
+        {
+            // Рассчитываем, сколько физических пикселей файла помещается в текущее окно
+            float visiblePixelsX = g_wndW * g_zoomDivider;
+            float visiblePixelsY = g_wndH * g_zoomDivider;
+
+            // Если сжатый масштаб кадра больше физического окна — режем текстурное окно под скроллинг долей
+            if (originalFileW > visiblePixelsX || originalFileH > visiblePixelsY)
+            {
+                float viewW = (originalFileW > 0.0f) ? visiblePixelsX / originalFileW : 1.0f;
+                float viewH = (originalFileH > 0.0f) ? visiblePixelsY / originalFileH : 1.0f;
+
+                if (viewW > 1.0f) viewW = 1.0f;
+                if (viewH > 1.0f) viewH = 1.0f;
+
+                tLeft = (1.0f - viewW) * g_scrollRatioX;
+                tRight = tLeft + viewW;
+                tTop = (1.0f - viewH) * g_scrollRatioY;
+                tBottom = tTop + viewH;
+            }
+            // Если сжатый кадр полностью поместился в окно — центрируем его и возвращаем серое поле!
+            else
+            {
+                screenRight = -1.0f + 2.0f * (originalFileW / (g_wndW * g_zoomDivider));
+                screenBottom = 1.0f - 2.0f * (originalFileH / (g_wndH * g_zoomDivider));
+            }
+        }
+    }
+
+    // Собираем выверенную сетку вершин
+    SimpleVertex currentVertices[] =
+    {
+        { { screenLeft,  screenTop,    0.0f },{ tLeft,  tTop } },
+        { { screenRight, screenTop,    0.0f },{ tRight, tTop } },
+        { { screenLeft,  screenBottom, 0.0f },{ tLeft,  tBottom } },
+        { { screenRight, screenBottom, 0.0f },{ tRight, tBottom } },
+    };
+
+    if (g_pVertexBuffer)
+    {
+        g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, currentVertices, 0, 0);
+    }
+
+    // Общие привязки конвейера
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
     g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState);
@@ -426,11 +571,11 @@ void Render()
     ID3D11ShaderResourceView* nullSRV[] = { NULL };
     float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
-    float renderW = (cbData.width > 0.0f) ? cbData.width : 32.0f;
-    float renderH = (cbData.height > 0.0f) ? cbData.height : 32.0f;
+    float renderW = (originalFileW > 0.0f) ? originalFileW : 32.0f;
+    float renderH = (originalFileH > 0.0f) ? originalFileH : 32.0f;
 
     // ========================================================================
-    // ДИАГНОСТИЧЕСКИЙ ПРОХОД: Направляем оригинальный гладкий кадр прямо в Stage3
+    // ДИАГНОСТИЧЕСКИЙ ПРОХОД: Расчет фильтров ВСЕГДА идет монолитно по всему файлу
     // ========================================================================
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
@@ -442,15 +587,13 @@ void Render()
     vpS3.MaxDepth = 1.0f;
     g_pImmediateContext->RSSetViewports(1, &vpS3);
 
-    // Включаем 5-й шейдер, подавая ему на оба входа g_pTextureSRV (оригинал)
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pTextureSRV); // Временно дублируем оригинал в слот t1!
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pTextureSRV);
     g_pImmediateContext->Draw(4, 0);
 
-
     // ========================================================================
-    // ФИНАЛЬНЫЙ ПРОХОД: Вывод шторки на реальный экран монитора 800х600
+    // ФИНАЛЬНЫЙ ПРОХОД: Вывод шторки на физический экран окна оператора
     // ========================================================================
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
@@ -459,20 +602,33 @@ void Render()
     g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
 
+    // ЗДЕСЬ ПОРТ ПРОСМОТРА ВСЕГДА РАВЕН КЛИЕНТСКОМУ ОКНУ ОКНА ОПЕРАТОРА
     D3D11_VIEWPORT vpFull = {};
-    vpFull.Width = 800.0f;
-    vpFull.Height = 600.0f;
+    vpFull.Width = g_wndW;
+    vpFull.Height = g_wndH;
     vpFull.MinDepth = 0.0f;
     vpFull.MaxDepth = 1.0f;
+    vpFull.TopLeftX = 0;
+    vpFull.TopLeftY = 0;
     g_pImmediateContext->RSSetViewports(1, &vpFull);
 
     // Включаем 6-й шейдер финальной шторки сравнения
     g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
 
-    // Подаем оригинал в слот t0, и результат Stage3 в слот t1
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+    // Передаем в шейдер текущую ширину окна, чтобы шторка стояла ровно по центру экрана окна!
+    cbData.width = g_wndW;
+    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
 
+    if (g_bUseCPUProcessing && g_pCpuTextureSRV)
+    {
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV);
+    }
+    else
+    {
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+    }
     g_pImmediateContext->Draw(4, 0);
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
@@ -587,7 +743,6 @@ void RenderSplit()
     g_pSwapChain->Present(0, 0);
 }
 
-
 // Безопасное освобождение памяти при выходе
 void CleanupDevice()
 {
@@ -599,6 +754,9 @@ void CleanupDevice()
     if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; } // НОВОЕ: Очистка холста записи Stage2
     if (g_pStage3SRV) { g_pStage3SRV->Release(); g_pStage3SRV = NULL; }
     if (g_pStage3RTV) { g_pStage3RTV->Release(); g_pStage3RTV = NULL; }
+    // Чистое освобождение ресурсов программного режима CPU
+    if (g_pCpuTextureSRV) { g_pCpuTextureSRV->Release(); g_pCpuTextureSRV = NULL; }
+    if (g_pCpuTexture) { g_pCpuTexture->Release();    g_pCpuTexture = NULL; }
     if (g_pSamplerState) { g_pSamplerState->Release(); g_pSamplerState = NULL; }
     if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = NULL; }
     if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
@@ -626,6 +784,23 @@ void CreateAppMenu(HWND hwnd)
     // Заполняем меню "Файл"
     AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_OPEN_VIDEO, L"Открыть видео поток (AVI/MP4)...");
     AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_OPEN_IMAGE, L"Открыть кадр/картинку (BMP/PNG)...");
+    // === НОВОЕ: ДОБАВЛЯЕМ УПРАВЛЕНИЕ РЕЖИМАМИ СРАВНЕНИЯ ===
+    AppendMenuW(hViewMenu, MF_STRING, IDM_VIEW_CPU, L"Программный режим (CPU)");
+    // === ВНЕДРЕНИЕ: КАСКАДНОЕ ПОДМЕНЮ ДИСКРЕТНЫХ МАСШТАБОВ ===
+    HMENU hZoomSubMenu = CreateMenu();
+    // Формируем 6 эталонных вариантов масштабирования
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_FIT, L"Вписать в кадр");
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_1, L"Масштаб 1:1 (Оригинал)");
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_2, L"Масштаб 1:2");
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_4, L"Масштаб 1:4");
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_8, L"Масштаб 1:8");
+    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_16, L"Масштаб 1:16");
+
+
+    // Встраиваем всплывающее подменю Масштаба внутрь нашего родительского меню "Вид" [INDEX_146]
+    AppendMenuW(hViewMenu, MF_POPUP, (UINT_PTR)hZoomSubMenu, L"Масштаб");
+
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, L"Вид");
     AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL); // Разделительная линия
     AppendMenuW(hFileMenu, MF_STRING, IDM_FILE_SAVE_RESULT, L"Записать преобразованный файл...");
     AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL);
@@ -714,6 +889,43 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             pTexture->Release();
         }
 
+        // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
+        if (SUCCEEDED(hr))
+        {
+            // Выделяем память под массив пикселей, который обработает процессор
+            UINT* pCpuOutPixels = new UINT[imgWidth * imgHeight];
+
+            // Запускаем расчет на процессоре по алгоритмам 2011 года!
+            if (SUCCEEDED(ApplyCpuFilter(pPixelsBuffer, imgWidth, imgHeight, pCpuOutPixels)))
+            {
+                // Описываем параметры для текстуры процессора
+                D3D11_TEXTURE2D_DESC cpuDesc = {};
+                cpuDesc.Width = imgWidth;
+                cpuDesc.Height = imgHeight;
+                cpuDesc.MipLevels = 1;
+                cpuDesc.ArraySize = 1;
+                cpuDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                cpuDesc.SampleDesc.Count = 1;
+                cpuDesc.Usage = D3D11_USAGE_DEFAULT;
+                cpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+                D3D11_SUBRESOURCE_DATA cpuInitData = {};
+                cpuInitData.pSysMem = pCpuOutPixels;
+                cpuInitData.SysMemPitch = imgWidth * sizeof(UINT);
+
+                // Физически создаем холст результатов CPU на видеокарте
+                ID3D11Texture2D* pCpuTex = NULL;
+                if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&cpuDesc, &cpuInitData, &pCpuTex)))
+                {
+                    g_pd3dDevice->CreateShaderResourceView(pCpuTex, NULL, &g_pCpuTextureSRV);
+                    pCpuTex->Release();
+                }
+            }
+
+            // Освобождаем временный массив результатов процессора из ОЗУ
+            delete[] pCpuOutPixels;
+        }
+
         // ========================================================================
         // СИНХРОНИЗАЦИЯ С КОДОМ 2011 ГОДА: ДИНАМИЧЕСКИЙ РЕЗАЙЗ СКРЫТЫХ БУФЕРОВ
         // ========================================================================
@@ -790,6 +1002,60 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             }
         }
     }
+    // === ИСПРАВЛЕНИЕ: ЖЕСТКОЕ И БЕЗОПАСНОЕ ИЗМЕНЕНИЕ РАЗМЕРОВ ОКНА ПРИ ОТКРЫТИИ ФАЙЛА ===
+    if (SUCCEEDED(hr))
+    {
+        HWND hMainWnd = FindWindowW(L"MyShaderVideoPlayerClass", NULL);
+        if (hMainWnd)
+        {
+            // Рассчитываем габариты окна с учетом меню и заголовка Windows
+            RECT rc = { 0, 0, (LONG)imgWidth, (LONG)imgHeight };
+            AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
+
+            // Физически раздвигаем окно под размер картинки!
+            MoveWindow(hMainWnd, 100, 100, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+        }
+    }
+
+    // ========================================================================
+// НАСТРОЙКА ДИАПАЗОНОВ С КРОЛЛИНГА ПОД РАЗМЕР КАРТИНКИ
+// ========================================================================
+    if (SUCCEEDED(hr))
+    {
+        // Сохраняем размеры файла для обработчика прокрутки
+        g_currentImgWidth = imgWidth;
+        g_currentImgHeight = imgHeight;
+        g_scrollX = 0;
+        g_scrollY = 0;
+
+        // === АВТОМАТИЧЕСКИЙ РАСЧЕТ КОЭФФИЦИЕНТОВ СКОРОСТИ СКРОЛЛИНГА ===
+        g_scrollMultiplierX = (imgWidth > (UINT)g_wndW) ? ((float)imgWidth / g_wndW) : 1.0f;
+        g_scrollMultiplierY = (imgHeight > (UINT)g_wndH) ? ((float)imgHeight / g_wndH) : 1.0f;
+
+        HWND hMainWnd = FindWindowW(L"MyShaderVideoPlayerClass", NULL);
+        if (hMainWnd)
+        {
+            // Настраиваем горизонтальный ползунок (X)
+            SCROLLINFO siX = {};
+            siX.cbSize = sizeof(SCROLLINFO);
+            siX.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            siX.nMin = 0;
+            siX.nMax = imgWidth;
+            siX.nPage = 800; // Шаг страницы равен размеру окна
+            siX.nPos = 0;
+            SetScrollInfo(hMainWnd, SB_HORZ, &siX, TRUE);
+
+            // Настраиваем вертикальный ползунок (Y)
+            SCROLLINFO siY = {};
+            siY.cbSize = sizeof(SCROLLINFO);
+            siY.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            siY.nMin = 0;
+            siY.nMax = imgHeight;
+            siY.nPage = 600;
+            siY.nPos = 0;
+            SetScrollInfo(hMainWnd, SB_VERT, &siY, TRUE);
+        }
+    }
 
     // === ЗОЛОТОЕ ПРАВИЛО: ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ БЕЗ УТЕЧЕК! ===
     delete[] pPixelsBuffer;
@@ -854,7 +1120,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     RegisterClass(&wc);
 
     HWND hwnd = CreateWindowEx(0, CLASS_NAME, L"Мой Шейдерный Видеоплеер",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, NULL, NULL, hInstance, NULL);
+        WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL, 
+        CW_USEDEFAULT, CW_USEDEFAULT, 
+        800, 600, 
+        NULL, NULL, hInstance, NULL);
 
     if (hwnd == NULL) return 0;
     ShowWindow(hwnd, nCmdShow);
@@ -874,7 +1143,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         // === О Т Л А Д О Ч Н Ы Й   М А Я Ч О К ===
         static bool bLoopStart = true;
         if (bLoopStart) {
-            MessageBoxW(hwnd, L"Маячок Ц-1: Мы успешно вошли в бесконечный цикл обработки сообщений wWinMain!", L"Отладка", MB_OK);
+            //MessageBoxW(hwnd, L"Маячок Ц-1: Мы успешно вошли в бесконечный цикл обработки сообщений wWinMain!", L"Отладка", MB_OK);
             bLoopStart = false;
         }
 
@@ -895,17 +1164,357 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     return 0;
 }
 
+// === ИСТИННАЯ ПРОГРАММНАЯ ОБРАБОТКА ИЗ 2011 ГОДА НА ЦЕНТРАЛЬНОМ ПРОЦЕССОРЕ (CPU) ===
+// === ИСТИННАЯ ПИРАМИДАЛЬНАЯ ФИЛЬТРАЦИЯ 2011 ГОДА НА ПРОЦЕССОРЕ (CPU) ===
+HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned int height, unsigned int* pOutPixels)
+{
+    if (!pSrcPixels || !pOutPixels || width == 0 || height == 0) return E_INVALIDARG;
+
+    // Весовые коэффициенты яркости монохрома из 2011 года
+    const float W_R = 0.299f;
+    const float W_G = 0.587f;
+    const float W_B = 0.114f;
+
+    // ------------------------------------------------------------------------
+    // МАССИВ p1: Переводим исходный кадр BGRA в монохромную матрицу яркости
+    // ------------------------------------------------------------------------
+    float* p1 = new float[width * height];
+    for (unsigned int i = 0; i < width * height; i++)
+    {
+        unsigned int pixel = pSrcPixels[i];
+        BYTE b = (pixel & 0x000000FF);
+        BYTE g = ((pixel & 0x0000FF00) >> 8);
+        BYTE r = ((pixel & 0x00FF0000) >> 16);
+
+        p1[i] = (float)r * W_R + (float)g * W_G + (float)b * W_B;
+    }
+
+    // ------------------------------------------------------------------------
+    // МАССИВ p2: Первый уровень пирамиды (сжатие блоков 4х4 пикселя)
+    // ------------------------------------------------------------------------
+    unsigned int w2 = width / 4;
+    unsigned int h2 = height / 4;
+    if (w2 == 0) w2 = 1;
+    if (h2 == 0) h2 = 1;
+
+    float* p2 = new float[w2 * h2];
+
+    // Цикл свертки блоков 4х4
+    for (unsigned int y = 0; y < h2; y++)
+    {
+        for (unsigned int x = 0; x < w2; x++)
+        {
+            float sum = 0.0f;
+            // Сканируем квадрат 4х4 пикселя из исходного массива p1
+            for (unsigned int block_y = 0; block_y < 4; block_y++)
+            {
+                unsigned int src_y = y * 4 + block_y;
+                if (src_y >= height) src_y = height - 1; // Защита от выхода за край
+
+                for (unsigned int block_x = 0; block_x < 4; block_x++)
+                {
+                    unsigned int src_x = x * 4 + block_x;
+                    if (src_x >= width) src_x = width - 1;
+
+                    sum += p1[src_y * width + src_x];
+                }
+            }
+            p2[y * w2 + x] = sum / 16.0f; // Среднее арифметическое блока 4х4
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // МАССИВ p3: Второй уровень пирамиды (укрупнение блоков в 8х8, или 2х2 от p2)
+    // ------------------------------------------------------------------------
+    unsigned int w3 = w2 / 2;
+    unsigned int h3 = h2 / 2;
+    if (w3 == 0) w3 = 1;
+    if (h3 == 0) h3 = 1;
+
+    float* p3 = new float[w3 * h3];
+
+    // Цикл свертки блоков 2х2 от предыдущего уровня p2
+    for (unsigned int y = 0; y < h3; y++)
+    {
+        for (unsigned int x = 0; x < w3; x++)
+        {
+            float sum = 0.0f;
+            for (unsigned int block_y = 0; block_y < 2; block_y++)
+            {
+                unsigned int src_y = y * 2 + block_y;
+                if (src_y >= h2) src_y = h2 - 1;
+
+                for (unsigned int block_x = 0; block_x < 2; block_x++)
+                {
+                    unsigned int src_x = x * 2 + block_x;
+                    if (src_x >= w2) src_x = w2 - 1;
+
+                    sum += p2[src_y * w2 + src_x];
+                }
+            }
+            p3[y * w3 + x] = sum / 4.0f; // Среднее арифметическое макроблока
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // СБОРКА И ФИНАЛЬНЫЙ ВЫВОД (Пока выводим промежуточный массив p1)
+    // ------------------------------------------------------------------------
+        // Цикл высокоточного межполукадрового анализа и интерполяции контуров
+    for (unsigned int y = 0; y < height; y++)
+    {
+        for (unsigned int x = 0; x < width; x++)
+        {
+            unsigned int idx = y * width + x;
+            float src_gray = p1[idx]; // Исходная точка кадра
+
+            // 1. ИНТЕРПОЛЯЦИЯ: Находим координаты текущей точки в укрупненных массивах p2 и p3
+            unsigned int x2 = x / 4;
+            unsigned int y2 = y / 4;
+            if (x2 >= w2) x2 = w2 - 1;
+            if (y2 >= h2) y2 = h2 - 1;
+            float macro_mid = p2[y2 * w2 + x2]; // Средняя яркость блока 4х4
+
+            unsigned int x3 = x / 8;
+            unsigned int y3 = y / 8;
+            if (x3 >= w3) x3 = w3 - 1;
+            if (y3 >= h3) y3 = h3 - 1;
+            float global_mid = p3[y3 * w3 + x3]; // Глобальный фон макроблока 8х8
+
+            // 2. ВЫЧИСЛЕНИЕ ДИСПЕРСИИ И ЛОКАЛЬНОГО КОНТРАСТА
+            float delta = src_gray - macro_mid;
+
+            // Внутренний сдвиг локальной разницы (аналог вашего макробарьера p4)
+            float local_dispersion = abs(macro_mid - global_mid);
+
+            // Защитный знаменатель против клякс и деления на ноль из 2011 года
+            float denom = local_dispersion + 12.75f;
+            float local_contrast = delta / denom;
+
+            // Жесткое ограничение диапазона среза, как в HLSL шейдере
+            if (local_contrast < -1.5f) local_contrast = -1.5f;
+            if (local_contrast > 1.5f)  local_contrast = 1.5f;
+
+            // 3. ФИНАЛЬНЫЙ СИНТЕЗ И КОРРЕКЦИЯ ДЕФЕКТОСКОПА
+            float out_gray = macro_mid + local_contrast * (local_dispersion * 1.8f);
+
+            // Нормализация яркости в стандартный диапазон [0.0, 255.0]
+            if (out_gray < 0.0f)   out_gray = 0.0f;
+            if (out_gray > 255.0f) out_gray = 255.0f;
+
+            // Честная гамма-коррекция 2.2 силами центрального процессора
+            float norm_gray = out_gray / 255.0f;
+            float corrected_gray = pow(norm_gray, 1.0f / 2.2f);
+
+            // Проявление скрытых микроконтуров
+            corrected_gray = corrected_gray * 1.05f - 0.02f;
+            if (corrected_gray < 0.0f) corrected_gray = 0.0f;
+            if (corrected_gray > 1.0f) corrected_gray = 1.0f;
+
+            // Собираем готовый пиксель обратно в формат BGRA для вывода шторки
+            BYTE final_byte = (BYTE)(corrected_gray * 255.0f);
+            pOutPixels[idx] = (0xFF000000) | (final_byte << 16) | (final_byte << 8) | final_byte;
+        }
+    }
+
+
+    // Чистое освобождение динамической памяти из ОЗУ компьютера
+    delete[] p1;
+    delete[] p2;
+    delete[] p3;
+
+    return S_OK;
+}
 
 // Главная точка входа Windows-приложения
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
+    case WM_HSCROLL:
+    {
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(SCROLLINFO);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_HORZ, &si);
+
+        int oldPos = si.nPos;
+        switch (LOWORD(wParam))
+        {
+        case SB_LINELEFT:   si.nPos -= 20; break;  // Кликнули на левую стрелочку
+        case SB_LINERIGHT:  si.nPos += 20; break;  // Кликнули на правую стрелочку
+        case SB_PAGELEFT:   si.nPos -= si.nPage; break;
+        case SB_PAGERIGHT:  si.nPos += si.nPage; break;
+        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break; // Тащат ползунок мышкой
+        }
+
+        // Зажимаем позицию в физические рамки картинки
+        if (si.nPos < 0) si.nPos = 0;
+        if (si.nPos > (int)(g_currentImgWidth - si.nPage)) si.nPos = (int)(g_currentImgWidth - si.nPage);
+
+        if (si.nPos != oldPos)
+        {
+            g_scrollX = si.nPos;
+
+            // ВАША ФУНДАМЕНТАЛЬНАЯ ФОРМУЛА ДОЛИ:
+            float denominatorX = (float)(si.nMax - si.nMin);
+            g_scrollRatioX = (denominatorX > 0.0f) ? (float)(si.nPos - si.nMin) / denominatorX : 0.0f;
+
+            SetScrollInfo(hwnd, SB_HORZ, &si, TRUE);
+            Render();
+        }
+    }
+    return 0;
+
+    case WM_VSCROLL:
+    {
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(SCROLLINFO);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+
+        int oldPos = si.nPos;
+        switch (LOWORD(wParam))
+        {
+        case SB_LINEUP:    si.nPos -= 20; break;  // Кликнули на верхнюю стрелочку
+        case SB_LINEDOWN:  si.nPos += 20; break;  // Кликнули на нижнюю стрелочку
+        case SB_PAGEUP:    si.nPos -= si.nPage; break;
+        case SB_PAGEDOWN:  si.nPos += si.nPage; break;
+        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break; // Тащат ползунок мышкой
+        }
+
+        if (si.nPos < 0) si.nPos = 0;
+        if (si.nPos > (int)(g_currentImgHeight - si.nPage)) si.nPos = (int)(g_currentImgHeight - si.nPage);
+
+        if (si.nPos != oldPos)
+        {
+            g_scrollY = si.nPos;
+
+            // ВАША ФУНДАМЕНТАЛЬНАЯ ФОРМУЛА ДОЛИ:
+            float denominatorY = (float)(si.nMax - si.nMin);
+            g_scrollRatioY = (denominatorY > 0.0f) ? (float)(si.nPos - si.nMin) / denominatorY : 0.0f;
+
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+            Render();
+        }
+
+    }
+    return 0;
+
+    case WM_SIZE:
+        if (g_pSwapChain != NULL)
+        {
+            UINT width = LOWORD(lParam);
+            UINT height = HIWORD(lParam);
+
+            if (width > 0 && height > 0)
+            {
+                if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
+
+                // Перестраиваем буферы SwapChain под новое разрешение
+                g_pSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+
+                ID3D11Texture2D* pBackBuffer = NULL;
+                g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+                if (pBackBuffer)
+                {
+                    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_pRenderTargetView);
+                    pBackBuffer->Release();
+                }
+
+                // Вызываем стандартную перерисовку
+                Render();
+            }
+        }
+        break;
+
+
+
         // === НОВЫЙ КОД: ОБРАБОТКА НАЖАТИЙ НА ПУНКТЫ МЕНЮ ===
     case WM_COMMAND:
         // В wParam система Windows передает ID нажатого пункта меню
         switch (LOWORD(wParam))
         {
+        case IDM_VIEW_CPU:
+            // 1. Инвертируем глобальный флаг
+            g_bUseCPUProcessing = !g_bUseCPUProcessing;
+
+            // 2. Ставим галочку в меню, используя точный идентификатор кнопки
+            CheckMenuItem(GetMenu(hwnd), IDM_VIEW_CPU, g_bUseCPUProcessing ? MF_CHECKED : MF_UNCHECKED);
+
+            // 3. Командуем окну немедленно перерисовать кадр
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+
+            // === НАСТОЯЩЕЕ ВНЕДРЕНИЕ: ОБРАБОТКА НАЖАТИЙ НА МАСШТАБЫ ДЕФЕКТОСКОПА ===
+        case IDM_ZOOM_FIT: g_bFitToWindow = true;  g_zoomDivider = 1.0f;  goto my_reset_scroll;
+        case IDM_ZOOM_1:   g_bFitToWindow = false; g_zoomDivider = 1.0f;  goto my_reset_scroll;
+        case IDM_ZOOM_2:   g_bFitToWindow = false; g_zoomDivider = 2.0f;  goto my_reset_scroll;
+        case IDM_ZOOM_4:   g_bFitToWindow = false; g_zoomDivider = 4.0f;  goto my_reset_scroll;
+        case IDM_ZOOM_8:   g_bFitToWindow = false; g_zoomDivider = 8.0f;  goto my_reset_scroll;
+        case IDM_ZOOM_16:  g_bFitToWindow = false; g_zoomDivider = 16.0f; goto my_reset_scroll;
+
+        my_reset_scroll:
+        {
+            // 1. Возвращаем скроллинг в исходный левый верхний угол кадра
+            g_scrollX = 0; g_scrollY = 0;
+            g_scrollRatioX = 0.0f; g_scrollRatioY = 0.0f;
+
+            // 2. АВТОМАТИЧЕСКАЯ РАССТАНОВКА ГАЛОЧЕК (V) В МЕНЮ ОКНА
+            HMENU hViewMenuRef = GetSubMenu(GetMenu(hwnd), 1); // Находим наше меню "Вид" (индекс 1)
+            if (hViewMenuRef)
+            {
+                HMENU hZoomMenuRef = GetSubMenu(hViewMenuRef, 1); // Находим подменю "Масштаб" внутри "Вида"
+                if (hZoomMenuRef)
+                {
+                    // Сбрасываем старые птички со всех 6 пунктов
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_FIT, MF_UNCHECKED);
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_1, MF_UNCHECKED);
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_2, MF_UNCHECKED);
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_4, MF_UNCHECKED);
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_8, MF_UNCHECKED);
+                    CheckMenuItem(hZoomMenuRef, IDM_ZOOM_16, MF_UNCHECKED);
+
+                    // Включаем галочку строго на выбранном оператором режиме!
+                    UINT activeID = IDM_ZOOM_FIT;
+                    if (!g_bFitToWindow)
+                    {
+                        if (g_zoomDivider == 1.0f)  activeID = IDM_ZOOM_1;
+                        if (g_zoomDivider == 2.0f)  activeID = IDM_ZOOM_2;
+                        if (g_zoomDivider == 4.0f)  activeID = IDM_ZOOM_4;
+                        if (g_zoomDivider == 8.0f)  activeID = IDM_ZOOM_8;
+                        if (g_zoomDivider == 16.0f) activeID = IDM_ZOOM_16;
+                    }
+                    CheckMenuItem(hZoomMenuRef, activeID, MF_CHECKED);
+                }
+            }
+
+            // 3. СИНХРОНИЗАЦИЯ ПОЛЗУНКОВ ПОД ВЫБРАННЫЙ МАСШТАБ
+            UINT currentMaxX = g_bFitToWindow ? (UINT)g_wndW : (UINT)((float)g_currentImgWidth / g_zoomDivider);
+            UINT currentMaxY = g_bFitToWindow ? (UINT)g_wndH : (UINT)((float)g_currentImgHeight / g_zoomDivider);
+
+            SCROLLINFO zoomSiX = {};
+            zoomSiX.cbSize = sizeof(SCROLLINFO);
+            zoomSiX.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            zoomSiX.nMin = 0;
+            zoomSiX.nMax = (currentMaxX > 0) ? currentMaxX : 1;
+            zoomSiX.nPage = (UINT)g_wndW;
+            zoomSiX.nPos = 0;
+            SetScrollInfo(hwnd, SB_HORZ, &zoomSiX, TRUE);
+
+            SCROLLINFO zoomSiY = {};
+            zoomSiY.cbSize = sizeof(SCROLLINFO);
+            zoomSiY.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            zoomSiY.nMin = 0;
+            zoomSiY.nMax = (currentMaxY > 0) ? currentMaxY : 1;
+            zoomSiY.nPage = (UINT)g_wndH;
+            zoomSiY.nPos = 0;
+            SetScrollInfo(hwnd, SB_VERT, &zoomSiY, TRUE);
+
+            // 4. Перерисовываем экран
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
         case IDM_FILE_EXIT:
             // Если нажали "Выход" — закрываем окно программы
             DestroyWindow(hwnd);
@@ -927,7 +1536,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (OpenFileDialog(hwnd, true))
             {
                 // Если файл выбран успешно — выведем его путь на экран для проверки
-                MessageBoxW(hwnd, g_szSelectedFilePath, L"Видео поток успешно подключен", MB_OK | MB_ICONINFORMATION);
+                //MessageBoxW(hwnd, g_szSelectedFilePath, L"Видео поток успешно подключен", MB_OK | MB_ICONINFORMATION);
 
                 // TODO: Здесь на следующем шаге мы запустим инициализацию Media Foundation
             }
@@ -963,34 +1572,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
         break;
         // === КОНЕЦ НОВОГО КОДА ===
-
-    case WM_SIZE:
-        if (g_pSwapChain)
-        {
-            if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
-            UINT width = LOWORD(lParam);
-            UINT height = HIWORD(lParam);
-            g_pSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
-
-            ID3D11Texture2D* pBackBuffer = NULL;
-            g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
-            if (pBackBuffer)
-            {
-                g_pd3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_pRenderTargetView);
-                pBackBuffer->Release();
-            }
-            g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
-
-            D3D11_VIEWPORT vp;
-            vp.Width = (FLOAT)width;
-            vp.Height = (FLOAT)height;
-            vp.MinDepth = 0.0f;
-            vp.MaxDepth = 1.0f;
-            vp.TopLeftX = 0;
-            vp.TopLeftY = 0;
-            g_pImmediateContext->RSSetViewports(1, &vp);
-        }
-        return 0;
 
     case WM_DESTROY:
         PostQuitMessage(0);

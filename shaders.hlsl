@@ -218,3 +218,24 @@ float4 PS_Final(VS_OUTPUT input) : SV_Target
     // Выводим гладкий результат высокой четкости
     return float4(corrected_gray, corrected_gray, corrected_gray, 1.0f);
 }
+
+// ========================================================================
+// ДОПОЛНИТЕЛЬНЫЙ ШЕЙДЕР: Качественное сжатие кадра ровно в 2 раза (Downsample)
+// ========================================================================
+Texture2D inputTexture : register(t0); // Входная текстура предыдущего масштаба
+
+float4 PS_Downsample2X(VS_OUTPUT input) : SV_Target
+{
+    // d_width и d_height хранят шаг одного пикселя (1.0 / размер_входной_текстуры)
+    float2 offset = float2(d_width, d_height);
+
+    // Считываем блок 2х2 соседних пикселей
+    float4 p00 = inputTexture.Sample(samplerState0, input.Tex);
+    float4 p10 = inputTexture.Sample(samplerState0, input.Tex + float2(offset.x, 0.0f));
+    float4 p01 = inputTexture.Sample(samplerState0, input.Tex + float2(0.0f, offset.y));
+    float4 p11 = inputTexture.Sample(samplerState0, input.Tex + offset);
+
+    // Возвращаем строгое среднее арифметическое без замыливания
+    return (p00 + p10 + p01 + p11) / 4.0f;
+}
+
