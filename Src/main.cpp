@@ -475,7 +475,7 @@ HRESULT InitDevice(HWND hwnd)
 // ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
 void Render()
 {
-    // ЖЕСТКИЙ ЗАМОК БЕЗОПАСНОСТИ: Не пускаем видеокарту рендерить, пока не загружен файл
+    // ЖЕСТКИЙ ЗАМОК БЕЗОПАСНОСТИ: Не пускаем видеокарту рендерить, пока не загружен файл и не создан мастер-буфер
     if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL || g_pStageMasterRTV == NULL) return;
 
     // 1. Настройка общих параметров сетки вершин
@@ -494,7 +494,7 @@ void Render()
     float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
 
-    // Автоматически получаем точные размеры загруженного файла напрямую из текстуры
+    // Автоматически и безопасно получаем точные размеры загруженного файла напрямую из текстуры
     UINT fileWidth = 32, fileHeight = 32;
     if (g_pTextureSRV) {
         ID3D11Resource* pRes = NULL;
@@ -515,27 +515,27 @@ void Render()
     // ЭТАП I: СКРЫТЫЕ АППАРАТНЫЕ ВЫЧИСЛЕНИЯ ПИРАМИДЫ ФИЛЬТРОВ (ПОЛНЫЙ РАЗМЕР ФАЙЛА)
     // ========================================================================
 
-    // Загружаем в видеокарту ЧИСТУЮ ЭТАЛОННУЮ ГЕОМЕТРИЮ квада
-    SimpleVertex masterVertices[] =
+    // Загружаем в видеокарту чистую эталонную геометрию квада для скрытых пассов
+    SimpleVertex masterVerticesQuad[] =
     {
         { { -1.0f,  1.0f, 0.0f },{ 0.0f, 0.0f } },
         { { 1.0f,  1.0f, 0.0f },{ 1.0f, 0.0f } },
         { { -1.0f, -1.0f, 0.0f },{ 0.0f, 1.0f } },
         { { 1.0f, -1.0f, 0.0f },{ 1.0f, 1.0f } },
     };
-    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, masterVertices, 0, 0);
+    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, masterVerticesQuad, 0, 0);
 
     // Жестко фиксируем порт просмотра под физические размеры файла
     D3D11_VIEWPORT vpS3 = { 0.0f, 0.0f, renderW, renderH, 0.0f, 1.0f };
     g_pImmediateContext->RSSetViewports(1, &vpS3);
 
-    // ОБЪЯВЛЯЕМ СТРУКТУРУ КОНСТАНТ ЛОКАЛЬНО, ЧТОБЫ ИСКЛЮЧИТЬ ОШИБКИ ОПРЕДЕЛЕНИЯ
+    // ОБЪЯВЛЯЕМ СТРУКТУРУ КОНСТАНТ ЛОКАЛЬНО ДЛЯ ИСКЛЮЧЕНИЯ ОШИБКИ C2065
     ShaderConstants cbData = {};
     cbData.width = renderW;
     cbData.height = renderH;
     cbData.d_width = 1.0f / renderW;
     cbData.d_height = 1.0f / renderH;
-    cbData.splitX = 0.5f; // Шторка строго по центру файла
+    cbData.splitX = 0.5f; // Шторка строго по центру full-size кадра
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
 
     // Пасс 1: Расчет Stage1 (Анализ блоков 4х4)
@@ -586,40 +586,56 @@ void Render()
     D3D11_VIEWPORT vpFull = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
     g_pImmediateContext->RSSetViewports(1, &vpFull);
 
-    // ВЫЧИСЛЯЕМ ЖИВУЮ ГЕОМЕТРИЮ ОКНА С УЧЕТОМ ПОЛЗУНКОВ И МАСШТАБА
-    float tLeft = 0.0f, tRight = 1.0f, tTop = 0.0f, tBottom = 1.0f;
+    // Вычисляем правильную живую геометрию вписывания/масштаба
+    float xLeft = -1.0f, xRight = 1.0f;
+    float yTop = 1.0f, yBottom = -1.0f;
 
     if (g_bFitToWindow)
     {
-        // Режим "Вписать в кадр": картинка занимает честные границы от -1.0 до +1.0
-        tLeft = 0.0f; tRight = 1.0f; tTop = 0.0f; tBottom = 1.0f;
+        // Честное пропорциональное вписывание в окно ("без чудовищ")
+        float windowAspect = (float)g_wndW / (float)g_wndH;
+        float imageAspect = (float)fileWidth / (float)fileHeight;
+
+        if (imageAspect > windowAspect) {
+            float scaleY = windowAspect / imageAspect;
+            yTop = scaleY; yBottom = -scaleY;
+        }
+        else {
+            float scaleX = imageAspect / windowAspect;
+            xLeft = -scaleX; xRight = scaleX;
+        }
     }
     else
     {
-        // Дискретные масштабы: вычисляем UV-окно сдвига на базе безразмерного скроллинга Win32
-        // g_zoomDivider равен 1.0 (для 1:1), 2.0 (для 1:2), 4.0 (для 1:4) и т.д.
-        float viewSizeX = 1.0f / g_zoomDivider;
-        float viewSizeY = 1.0f / g_zoomDivider;
+        // Истинные пиксели 1:1 и дискретные масштабы со сдвигом от ползунков
+        float targetW = (float)fileWidth / g_zoomDivider;
+        float targetH = (float)fileHeight / g_zoomDivider;
 
-        tLeft = g_scrollRatioX * (1.0f - viewSizeX);
-        tRight = tLeft + viewSizeX;
-        tTop = g_scrollRatioY * (1.0f - viewSizeY);
-        tBottom = tTop + viewSizeY;
+        float maxScrollX = (targetW > (float)g_wndW) ? (targetW - (float)g_wndW) : 0.0f;
+        float maxScrollY = (targetH > (float)g_wndH) ? (targetH - (float)g_wndH) : 0.0f;
+
+        float currentOffsetX = g_scrollRatioX * maxScrollX;
+        float currentOffsetY = g_scrollRatioY * maxScrollY;
+
+        float posX = -currentOffsetX;
+        float posY = -currentOffsetY;
+
+        xLeft = (posX / (float)g_wndW) * 2.0f - 1.0f;
+        xRight = ((posX + targetW) / (float)g_wndW) * 2.0f - 1.0f;
+        yTop = 1.0f - (posY / (float)g_wndH) * 2.0f;
+        yBottom = 1.0f - ((posY + targetH) / (float)g_wndH) * 2.0f;
     }
 
-    // Запекаем живые координаты в массив вершин вывода
-    SimpleVertex liveVertices[] =
-    {
-        { { -1.0f,  1.0f, 0.0f },{ tLeft,  tTop } },
-        { { 1.0f,  1.0f, 0.0f },{ tRight, tTop } },
-        { { -1.0f, -1.0f, 0.0f },{ tLeft,  tBottom } },
-        { { 1.0f, -1.0f, 0.0f },{ tRight, tBottom } },
-    };
+    // ИСПРАВЛЕНО: Заполняем глобальный массив g_currentVertices строго по индексам [0..3]
+    g_currentVertices[0] = { { xLeft,  yTop,    0.0f },{ 0.0f, 0.0f } };
+    g_currentVertices[1] = { { xRight, yTop,    0.0f },{ 1.0f, 0.0f } };
+    g_currentVertices[2] = { { xLeft,  yBottom, 0.0f },{ 0.0f, 1.0f } };
+    g_currentVertices[3] = { { xRight, yBottom, 0.0f },{ 1.0f, 1.0f } };
 
-    // Загружаем вычисленные liveVertices в видеокарту
-    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, liveVertices, 0, 0);
+    // Загружаем живую геометрию вывода в видеокарту
+    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, g_currentVertices, 0, 0);
 
-    // Включаем наш чистый шейдер сквозного копирования
+    // Включаем чистый копирующий шейдер "один в один"
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
 
@@ -631,6 +647,7 @@ void Render()
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pSwapChain->Present(0, 0);
 }
+
 
 // === НОВЫЙ БЕЗОПАСНЫЙ КОД: ФУНКЦИЯ ДВУХЭКРАННОГО ВЫВОДА "ДО / ПОСЛЕ" ===
 void RenderSplit()
