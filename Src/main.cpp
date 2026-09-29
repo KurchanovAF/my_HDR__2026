@@ -39,6 +39,8 @@ struct ShaderConstants
     float height;    // Высота картинки
     float d_width;   // Шаг одного пикселя по горизонтали (1.0 / width)
     float d_height;  // Шаг одного пикселя по вертикали (1.0 / height)
+    float splitX;   // Положение шторки (доля от 0.0 до 1.0)
+    float padding[3]; // Выравнивание структуры в памяти под требования DirectX (кратность 16 байт)
 };
 
 // Прототип функции программной фильтрации на центральном процессоре
@@ -58,6 +60,10 @@ ID3D11ShaderResourceView* g_pStage2SRV = NULL; // Ссылка на макроа
 // ОБЪЕКТЫ ДЛЯ ФИЛЬТРА ГЛОБАЛЬНОЙ КОНТРАСТНОСТИ (5-Й ШЕЙДЕР)
 ID3D11RenderTargetView* g_pStage3RTV = NULL; // Холст для записи HDR-фильтра
 ID3D11ShaderResourceView* g_pStage3SRV = NULL; // Ссылка на этот результат
+
+// === НОВЫЙ КОД: МАСТЕР-БУФЕР ДЛЯ ПОЛНОРАЗМЕРНОЙ СКЛЕЙКИ ШТОРКИ ===
+ID3D11RenderTargetView* g_pStageMasterRTV = NULL;   // Холст для записи полноразмерной шторки
+ID3D11ShaderResourceView* g_pStageMasterSRV = NULL; // Ссылка на мастер-кадр для последующего сжатия
 
 // === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
@@ -121,9 +127,12 @@ ID3D11PixelShader* g_pPixelShader = NULL;      // Пиксельный шейд�
 ID3D11PixelShader* g_pPixelShaderStage2 = NULL; // НОВОЕ: Указатель на 4-й шейдер анализа макроблоков 8х8
 ID3D11PixelShader* g_pPixelShaderStage3 = NULL; // НОВОЕ: Указатель на 5-й шейдер адаптивной фильтрации контраста
 ID3D11PixelShader* g_pPixelShaderFinal = NULL;  // НОВОЕ: Указатель на 6-й шейдер финальной цветокоррекции и гаммы
+ID3D11PixelShader* g_pPixelShaderCopy = NULL;  // Указатель на новый чистый шейдер копирования кадра
 
 ID3D11InputLayout* g_pVertexLayout = NULL;     // Формат вершин
 ID3D11Buffer* g_pVertexBuffer = NULL;     // Буфер геометрии
+
+SimpleVertex g_currentVertices[4];    // Массив вершин, хранящий живую геометрию скроллинга окна
 
 ID3D11ShaderResourceView* g_pTextureSRV = NULL;       // Наша текстура 2х2
 ID3D11SamplerState* g_pSamplerState = NULL;     // Жесткий сэмплер (Point)
@@ -255,12 +264,21 @@ HRESULT InitDevice(HWND hwnd)
     pPSBlob->Release();
     if (FAILED(hr)) return hr;
 
-    // === КОМПИЛЯЦИЯ НОВОГО ШЕЙДЕРА ПИРАМИДАЛЬНОГО СЖАТИЯ ===
-    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Downsample2X", "ps_4_0", &pBlob);
+    // КОМПИЛЯЦИЯ И СОЗДАНИЕ НАШЕГО ШЕЙДЕРА КОПИРОВАНИЯ
+    ID3DBlob* pPSCopyBlob = NULL;
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Copy", "ps_4_0", &pPSCopyBlob);
+    if (FAILED(hr)) return hr;
+    hr = g_pd3dDevice->CreatePixelShader(pPSCopyBlob->GetBufferPointer(), pPSCopyBlob->GetBufferSize(), NULL, &g_pPixelShaderCopy);
+    pPSCopyBlob->Release();
     if (FAILED(hr)) return hr;
 
-    hr = g_pd3dDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), NULL, &g_pPixelShaderDownsample);
-    pBlob->Release();
+    // === КОМПИЛЯЦИЯ НОВОГО ШЕЙДЕРА ПИРАМИДАЛЬНОГО СЖАТИЯ ===
+    ID3DBlob* pDownsampleBlob = NULL; // ОБЪЯВЛЯЕМ ПРОПУЩЕННЫЙ БУФЕР ДЛЯ СЖАТИЯ
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Downsample2X", "ps_4_0", &pDownsampleBlob);
+    if (FAILED(hr)) return hr;
+
+    hr = g_pd3dDevice->CreatePixelShader(pDownsampleBlob->GetBufferPointer(), pDownsampleBlob->GetBufferSize(), NULL, &g_pPixelShaderDownsample);
+    pDownsampleBlob->Release(); // Чисто освобождаем буфер
     if (FAILED(hr)) return hr;
 
     // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 4-ГО ШЕЙДЕРА (STAGE 2) ===
@@ -457,186 +475,162 @@ HRESULT InitDevice(HWND hwnd)
 // ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
 void Render()
 {
-    if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL) return;
+    // ЖЕСТКИЙ ЗАМОК БЕЗОПАСНОСТИ: Не пускаем видеокарту рендерить, пока не загружен файл
+    if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL || g_pStageMasterRTV == NULL) return;
 
-    // 1. Общие настройки сетки экрана
+    // 1. Настройка общих параметров сетки вершин
     UINT stride = sizeof(SimpleVertex);
     UINT offset = 0;
     g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &stride, &offset);
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
 
-    // 2. Запрашиваем физические размеры кадра
-    ShaderConstants cbData;
-    cbData.width = 0.0f;
-    cbData.height = 0.0f;
-
-    ID3D11Resource* pResource = NULL;
-    g_pTextureSRV->GetResource(&pResource);
-    if (pResource)
-    {
-        ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pResource;
-        D3D11_TEXTURE2D_DESC desc;
-        pTex2D->GetDesc(&desc);
-        cbData.width = (float)desc.Width;
-        cbData.height = (float)desc.Height;
-        pResource->Release();
-    }
-
-    float originalFileW = cbData.width;
-    float originalFileH = cbData.height;
-
-    // Расчет шагов пикселя для промежуточных аналитических этапов (всегда в полный размер кадра!)
-    cbData.d_width = (cbData.width > 0.0f) ? (1.0f / cbData.width) : 0.0f;
-    cbData.d_height = (cbData.height > 0.0f) ? (1.0f / cbData.height) : 0.0f;
-    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
-
-    // === ЖЕЛЕЗОБЕТОННАЯ МАТЕМАТИКА КОНВЕЙЕРА: ВПИСЫВАНИЕ И МАСШТАБЫ ПИКСЕЛЬ В ПИКСЕЛЬ ===
-
-// 1. Стартовые текстурные координаты (вся картинка целиком)
-    float tLeft = 0.0f, tRight = 1.0f, tTop = 0.0f, tBottom = 1.0f;
-    // Стартовые геометрические рамки квада на экране (на все окно от -1.0 до +1.0)
-    float screenLeft = -1.0f, screenRight = 1.0f, screenTop = 1.0f, screenBottom = -1.0f;
-
-    if (originalFileW > 0.0f && originalFileH > 0.0f)
-    {
-        // --------------------------------------------------------------------
-        // ВАРИАНТ А: Режим "Вписать в кадр" (Автоматическое ужимание под размеры окна)
-        // --------------------------------------------------------------------
-        if (g_bFitToWindow)
-        {
-            // Вычисляем коэффициенты пропорций, чтобы лица не растягивались в "чудовище"!
-            float ratioW = g_wndW / originalFileW;
-            float ratioH = g_wndH / originalFileH;
-            float minRatio = (ratioW < ratioH) ? ratioW : ratioH;
-
-            float fitWidth = originalFileW * minRatio;
-            float fitHeight = originalFileH * minRatio;
-
-            // Сжимаем геометрические рамки квада строго под пропорции кадра, оставляя серое поле!
-            screenRight = -1.0f + 2.0f * (fitWidth / g_wndW);
-            screenBottom = 1.0f - 2.0f * (fitHeight / g_wndH);
-        }
-        // --------------------------------------------------------------------
-        // ВАРИАНТ Б: Честная дискретная масштабная сетка (1:1, 1:2, 1:4, 1:8, 1:16)
-        // --------------------------------------------------------------------
-        else
-        {
-            // Рассчитываем, сколько физических пикселей файла помещается в текущее окно
-            float visiblePixelsX = g_wndW * g_zoomDivider;
-            float visiblePixelsY = g_wndH * g_zoomDivider;
-
-            // Если сжатый масштаб кадра больше физического окна — режем текстурное окно под скроллинг долей
-            if (originalFileW > visiblePixelsX || originalFileH > visiblePixelsY)
-            {
-                float viewW = (originalFileW > 0.0f) ? visiblePixelsX / originalFileW : 1.0f;
-                float viewH = (originalFileH > 0.0f) ? visiblePixelsY / originalFileH : 1.0f;
-
-                if (viewW > 1.0f) viewW = 1.0f;
-                if (viewH > 1.0f) viewH = 1.0f;
-
-                tLeft = (1.0f - viewW) * g_scrollRatioX;
-                tRight = tLeft + viewW;
-                tTop = (1.0f - viewH) * g_scrollRatioY;
-                tBottom = tTop + viewH;
-            }
-            // Если сжатый кадр полностью поместился в окно — центрируем его и возвращаем серое поле!
-            else
-            {
-                screenRight = -1.0f + 2.0f * (originalFileW / (g_wndW * g_zoomDivider));
-                screenBottom = 1.0f - 2.0f * (originalFileH / (g_wndH * g_zoomDivider));
-            }
-        }
-    }
-
-    // Собираем выверенную сетку вершин
-    SimpleVertex currentVertices[] =
-    {
-        { { screenLeft,  screenTop,    0.0f },{ tLeft,  tTop } },
-        { { screenRight, screenTop,    0.0f },{ tRight, tTop } },
-        { { screenLeft,  screenBottom, 0.0f },{ tLeft,  tBottom } },
-        { { screenRight, screenBottom, 0.0f },{ tRight, tBottom } },
-    };
-
-    if (g_pVertexBuffer)
-    {
-        g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, currentVertices, 0, 0);
-    }
-
-    // Общие привязки конвейера
+    // Привязываем базовые шейдеры и постоянные ресурсы конвейера
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
     g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState);
 
+    // Локальные переменные и цвета очистки буферов
     ID3D11ShaderResourceView* nullSRV[] = { NULL };
     float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
 
-    float renderW = (originalFileW > 0.0f) ? originalFileW : 32.0f;
-    float renderH = (originalFileH > 0.0f) ? originalFileH : 32.0f;
+    // Автоматически получаем точные размеры загруженного файла напрямую из текстуры
+    UINT fileWidth = 32, fileHeight = 32;
+    if (g_pTextureSRV) {
+        ID3D11Resource* pRes = NULL;
+        g_pTextureSRV->GetResource(&pRes);
+        if (pRes) {
+            ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pRes;
+            D3D11_TEXTURE2D_DESC tDesc;
+            pTex2D->GetDesc(&tDesc);
+            fileWidth = tDesc.Width;
+            fileHeight = tDesc.Height;
+            pRes->Release();
+        }
+    }
+    float renderW = (float)fileWidth;
+    float renderH = (float)fileHeight;
 
     // ========================================================================
-    // ДИАГНОСТИЧЕСКИЙ ПРОХОД: Расчет фильтров ВСЕГДА идет монолитно по всему файлу
+    // ЭТАП I: СКРЫТЫЕ АППАРАТНЫЕ ВЫЧИСЛЕНИЯ ПИРАМИДЫ ФИЛЬТРОВ (ПОЛНЫЙ РАЗМЕР ФАЙЛА)
     // ========================================================================
-    g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
 
-    D3D11_VIEWPORT vpS3 = {};
-    vpS3.Width = renderW;
-    vpS3.Height = renderH;
-    vpS3.MinDepth = 0.0f;
-    vpS3.MaxDepth = 1.0f;
+    // Загружаем в видеокарту ЧИСТУЮ ЭТАЛОННУЮ ГЕОМЕТРИЮ квада
+    SimpleVertex masterVertices[] =
+    {
+        { { -1.0f,  1.0f, 0.0f },{ 0.0f, 0.0f } },
+        { { 1.0f,  1.0f, 0.0f },{ 1.0f, 0.0f } },
+        { { -1.0f, -1.0f, 0.0f },{ 0.0f, 1.0f } },
+        { { 1.0f, -1.0f, 0.0f },{ 1.0f, 1.0f } },
+    };
+    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, masterVertices, 0, 0);
+
+    // Жестко фиксируем порт просмотра под физические размеры файла
+    D3D11_VIEWPORT vpS3 = { 0.0f, 0.0f, renderW, renderH, 0.0f, 1.0f };
     g_pImmediateContext->RSSetViewports(1, &vpS3);
 
+    // ОБЪЯВЛЯЕМ СТРУКТУРУ КОНСТАНТ ЛОКАЛЬНО, ЧТОБЫ ИСКЛЮЧИТЬ ОШИБКИ ОПРЕДЕЛЕНИЯ
+    ShaderConstants cbData = {};
+    cbData.width = renderW;
+    cbData.height = renderH;
+    cbData.d_width = 1.0f / renderW;
+    cbData.d_height = 1.0f / renderH;
+    cbData.splitX = 0.5f; // Шторка строго по центру файла
+    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
+
+    // Пасс 1: Расчет Stage1 (Анализ блоков 4х4)
+    g_pImmediateContext->ClearRenderTargetView(g_pStage1RTV, ClearColorBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage1RTV, NULL);
+    g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+    g_pImmediateContext->Draw(4, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+    // Пасс 2: Расчет Stage2 (Анализ макроблоков 8х8)
+    g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearColorBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage2RTV, NULL);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderStage2, NULL, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage1SRV);
+    g_pImmediateContext->Draw(4, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+    // Пасс 3: Расчет Stage3 (Дефектоскоп 3х3 локального контраста)
+    g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pTextureSRV);
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage2SRV);
     g_pImmediateContext->Draw(4, 0);
-
-    // ========================================================================
-    // ФИНАЛЬНЫЙ ПРОХОД: Вывод шторки на физический экран окна оператора
-    // ========================================================================
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
 
-    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
+    // Пасс 4: Сборка шторки "До / После" в Полноразмерный Мастер-Буфер
+    g_pImmediateContext->ClearRenderTargetView(g_pStageMasterRTV, ClearColorBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageMasterRTV, NULL);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+    g_pImmediateContext->Draw(4, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+    g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
+
+    // ========================================================================
+    // ЭТАП II: ВЫВОД ГОТОВОЙ КАРТИНКИ НА ФИЗИЧЕСКИЙ ЭКРАН ОКНА ОПЕРАТОРА
+    // ========================================================================
+
+    // Переключаем конвейер на реальный экран программы
     g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
 
-    // ЗДЕСЬ ПОРТ ПРОСМОТРА ВСЕГДА РАВЕН КЛИЕНТСКОМУ ОКНУ ОКНА ОПЕРАТОРА
-    D3D11_VIEWPORT vpFull = {};
-    vpFull.Width = g_wndW;
-    vpFull.Height = g_wndH;
-    vpFull.MinDepth = 0.0f;
-    vpFull.MaxDepth = 1.0f;
-    vpFull.TopLeftX = 0;
-    vpFull.TopLeftY = 0;
+    // Настраиваем Viewport под текущие физические размеры окна программы
+    D3D11_VIEWPORT vpFull = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
     g_pImmediateContext->RSSetViewports(1, &vpFull);
 
-    // Включаем 6-й шейдер финальной шторки сравнения
-    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
+    // ВЫЧИСЛЯЕМ ЖИВУЮ ГЕОМЕТРИЮ ОКНА С УЧЕТОМ ПОЛЗУНКОВ И МАСШТАБА
+    float tLeft = 0.0f, tRight = 1.0f, tTop = 0.0f, tBottom = 1.0f;
 
-    // Передаем в шейдер текущую ширину окна, чтобы шторка стояла ровно по центру экрана окна!
-    cbData.width = g_wndW;
-    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbData, 0, 0);
-
-    if (g_bUseCPUProcessing && g_pCpuTextureSRV)
+    if (g_bFitToWindow)
     {
-        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV);
+        // Режим "Вписать в кадр": картинка занимает честные границы от -1.0 до +1.0
+        tLeft = 0.0f; tRight = 1.0f; tTop = 0.0f; tBottom = 1.0f;
     }
     else
     {
-        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+        // Дискретные масштабы: вычисляем UV-окно сдвига на базе безразмерного скроллинга Win32
+        // g_zoomDivider равен 1.0 (для 1:1), 2.0 (для 1:2), 4.0 (для 1:4) и т.д.
+        float viewSizeX = 1.0f / g_zoomDivider;
+        float viewSizeY = 1.0f / g_zoomDivider;
+
+        tLeft = g_scrollRatioX * (1.0f - viewSizeX);
+        tRight = tLeft + viewSizeX;
+        tTop = g_scrollRatioY * (1.0f - viewSizeY);
+        tBottom = tTop + viewSizeY;
     }
+
+    // Запекаем живые координаты в массив вершин вывода
+    SimpleVertex liveVertices[] =
+    {
+        { { -1.0f,  1.0f, 0.0f },{ tLeft,  tTop } },
+        { { 1.0f,  1.0f, 0.0f },{ tRight, tTop } },
+        { { -1.0f, -1.0f, 0.0f },{ tLeft,  tBottom } },
+        { { 1.0f, -1.0f, 0.0f },{ tRight, tBottom } },
+    };
+
+    // Загружаем вычисленные liveVertices в видеокарту
+    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, liveVertices, 0, 0);
+
+    // Включаем наш чистый шейдер сквозного копирования
+    g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
+
+    // Выводим на экран полностью готовый, статично склеенный мастер-кадр
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
     g_pImmediateContext->Draw(4, 0);
 
+    // Чисто сбрасываем ресурсы и выводим кадр на монитор оператора
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
-    g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
-
     g_pSwapChain->Present(0, 0);
 }
-
 
 // === НОВЫЙ БЕЗОПАСНЫЙ КОД: ФУНКЦИЯ ДВУХЭКРАННОГО ВЫВОДА "ДО / ПОСЛЕ" ===
 void RenderSplit()
@@ -754,6 +748,8 @@ void CleanupDevice()
     if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; } // НОВОЕ: Очистка холста записи Stage2
     if (g_pStage3SRV) { g_pStage3SRV->Release(); g_pStage3SRV = NULL; }
     if (g_pStage3RTV) { g_pStage3RTV->Release(); g_pStage3RTV = NULL; }
+    if (g_pStageMasterSRV) { g_pStageMasterSRV->Release(); g_pStageMasterSRV = NULL; }
+    if (g_pStageMasterRTV) { g_pStageMasterRTV->Release(); g_pStageMasterRTV = NULL; }
     // Чистое освобождение ресурсов программного режима CPU
     if (g_pCpuTextureSRV) { g_pCpuTextureSRV->Release(); g_pCpuTextureSRV = NULL; }
     if (g_pCpuTexture) { g_pCpuTexture->Release();    g_pCpuTexture = NULL; }
@@ -766,6 +762,7 @@ void CleanupDevice()
     if (g_pPixelShaderStage2) { g_pPixelShaderStage2->Release(); g_pPixelShaderStage2 = NULL; } // НОВОЕ: Очистка 4-го шейдера анализа
     if (g_pPixelShaderStage3) { g_pPixelShaderStage3->Release(); g_pPixelShaderStage3 = NULL; } // НОВОЕ: Очистка 5-го шейдера фильтрации
     if (g_pPixelShaderFinal) { g_pPixelShaderFinal->Release(); g_pPixelShaderFinal = NULL; } // НОВОЕ: Очистка 6-го шейдера цветокоррекции
+    if (g_pPixelShaderCopy) { g_pPixelShaderCopy->Release(); g_pPixelShaderCopy = NULL; }
     if (g_pVertexShader) { g_pVertexShader->Release(); g_pVertexShader = NULL; }
     if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = NULL; }
@@ -1001,6 +998,25 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 pTexS3->Release();
             }
         }
+        if (g_pStageMasterRTV) { g_pStageMasterRTV->Release(); g_pStageMasterRTV = NULL; }
+        if (g_pStageMasterSRV) { g_pStageMasterSRV->Release(); g_pStageMasterSRV = NULL; }
+
+        D3D11_TEXTURE2D_DESC descMaster = {};
+        descMaster.Width = imgWidth;
+        descMaster.Height = imgHeight;
+        descMaster.MipLevels = 1;
+        descMaster.ArraySize = 1;
+        descMaster.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        descMaster.SampleDesc.Count = 1;
+        descMaster.Usage = D3D11_USAGE_DEFAULT;
+        descMaster.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        ID3D11Texture2D* pTexMaster = NULL;
+        if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&descMaster, NULL, &pTexMaster))) {
+            g_pd3dDevice->CreateRenderTargetView(pTexMaster, NULL, &g_pStageMasterRTV);
+            g_pd3dDevice->CreateShaderResourceView(pTexMaster, NULL, &g_pStageMasterSRV);
+            pTexMaster->Release();
+        }
     }
     // === ИСПРАВЛЕНИЕ: ЖЕСТКОЕ И БЕЗОПАСНОЕ ИЗМЕНЕНИЕ РАЗМЕРОВ ОКНА ПРИ ОТКРЫТИИ ФАЙЛА ===
     if (SUCCEEDED(hr))
@@ -1071,12 +1087,16 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
 {
     OPENFILENAMEW ofn = {};
-    wchar_t szFile[MAX_PATH] = L"";
-
+    // ========================================================================
+    // >>> ИСПРАВЛЯЕМ СМЕРТЕЛЬНУЮ ЛОВУШКУ ДЛЯ NTDLL.DLL: ДЕЛАЕМ БУФЕР СТАТИЧЕСКИМ
+    // ========================================================================
+    static wchar_t szFile[MAX_PATH];
+    ZeroMemory(szFile, sizeof(szFile)); // Чисто обнуляем буфер перед каждым вызовом
+    // ========================================================================
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile) / sizeof(szFile[0]);
+    ofn.nMaxFile = MAX_PATH; // Жестко задаем максимальный размер
 
     if (bOpenVideo)
     {
@@ -1143,7 +1163,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         // === О Т Л А Д О Ч Н Ы Й   М А Я Ч О К ===
         static bool bLoopStart = true;
         if (bLoopStart) {
-            //MessageBoxW(hwnd, L"Маячок Ц-1: Мы успешно вошли в бесконечный цикл обработки сообщений wWinMain!", L"Отладка", MB_OK);
+            MessageBoxW(hwnd, L"Маячок Ц-1: Мы успешно вошли в бесконечный цикл обработки сообщений wWinMain!", L"Отладка", MB_OK);
             bLoopStart = false;
         }
 

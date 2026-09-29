@@ -26,7 +26,9 @@ cbuffer cbData : register(b0)
     float width;     
     float height;    
     float d_width;   
-    float d_height;  
+    float d_height; 
+    float splitX;
+    float padding;
 };
 
 // Константа весов яркости из 2011 года
@@ -186,37 +188,41 @@ float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 // ========================================================================
 // 6-Й ШЕЙДЕР: Чистый вывод шторки "До / После" (Pass 4)
 // ========================================================================
+
 float4 PS_Final(VS_OUTPUT input) : SV_Target
 {
-    // 1. Читаем ИСХОДНЫЙ полноразмерный монохромный кадр (слот t0)
-    float4 src_color = srcTexture.Sample(samplerState0, input.Tex);
-    float src_gray = dot(src_color.rgb, WEIGHT);
+ // 1. Читаем ИСХОДНЫЙ полноразмерный монохромный кадр (слот t0)
+ float4 src_color = srcTexture.Sample(samplerState0, input.Tex);
+ float src_gray = dot(src_color.rgb, WEIGHT);
 
-    // ИНТЕЛЛЕКТУАЛЬНАЯ ШТОРКА СРАВНЕНИЯ:
-    // Если пиксель находится в ЛЕВОЙ половине экрана — выводим чистый оригинал
-    if (input.Tex.x < 0.5f)
-    {
-        return float4(src_gray, src_gray, src_gray, 1.0f);
-    }
+ // ИНТЕЛЛЕКТУАЛЬНАЯ ШТОРКА СРАВНЕНИЯ:
+// ========================================================================
+// >>> МЫ ИСПРАВЛЯЕМ МАТЕМАТИКУ РАЗДЕЛЕНИЯ НА БАЗЕ НАШЕЙ ПЕРЕМЕННОЙ splitX:
+// ========================================================================
+ // Если пиксель находится в ЛЕВОЙ половине экрана — выводим чистый оригинал
+ if (input.Tex.x < splitX)
+ {
+ return float4(src_gray, src_gray, src_gray, 1.0f);
+ }
 
-    // --- ПРАВАЯ ПОЛОВИНА: Выводим уже готовый, отфильтрованный гладкий кадр из Stage3 ---
-    // Читаем результат работы 5-го шейдера из специального слота t1
-    float4 filtered_color = statsTexture.Sample(samplerState0, input.Tex);
-    float gray_filtered = filtered_color.x; 
+ // --- ПРАВАЯ ПОЛОВИНА: Выводим уже готовый, отфильтрованный гладкий кадр из Stage3 ---
+ // Читаем результат работы 5-го шейдера из специального слота t1
+ float4 filtered_color = statsTexture.Sample(samplerState0, input.Tex);
+ float gray_filtered = filtered_color.x; 
 
-    // Применяем финальную гамма-коррекцию из 2011 года для проявления деталей
-    float corrected_gray = pow(abs(gray_filtered), 1.0f / 2.2f);
-    corrected_gray = corrected_gray * 1.05f - 0.02f;
-    corrected_gray = saturate(corrected_gray);
+ // Применяем финальную гамма-коррекцию из 2011 года для проявления деталей
+ float corrected_gray = pow(abs(gray_filtered), 1.0f / 2.2f);
+ corrected_gray = corrected_gray * 1.05f - 0.02f;
+ corrected_gray = saturate(corrected_gray);
 
-    // Рисуем тонкую разделительную черную линию ровно по центру экрана
-    if (abs(input.Tex.x - 0.5f) < 0.002f)
-    {
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
+ // Рисуем тонкую разделительную черную линию ровно по положению шторки
+ if (abs(input.Tex.x - splitX) < 0.002f)
+ {
+ return float4(0.0f, 0.0f, 0.0f, 1.0f);
+ }
 
-    // Выводим гладкий результат высокой четкости
-    return float4(corrected_gray, corrected_gray, corrected_gray, 1.0f);
+ // Выводим гладкий результат высокой четкости
+ return float4(corrected_gray, corrected_gray, corrected_gray, 1.0f);
 }
 
 // ========================================================================
@@ -237,5 +243,14 @@ float4 PS_Downsample2X(VS_OUTPUT input) : SV_Target
 
     // Возвращаем строгое среднее арифметическое без замыливания
     return (p00 + p10 + p01 + p11) / 4.0f;
+}
+
+// ========================================================================
+// НОВЫЙ ЧИСТЫЙ ШЕЙДЕР СКВОЗНОГО КОПИРОВАНИЯ КАДРА
+// ========================================================================
+float4 PS_Copy(VS_OUTPUT input) : SV_Target
+{
+    // Просто считываем пиксель один в один без фильтрации и изменений
+    return srcTexture.Sample(samplerState0, input.Tex);
 }
 
