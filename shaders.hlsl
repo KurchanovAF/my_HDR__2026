@@ -46,8 +46,6 @@ float4 func_LT(float2 tex_in)
     float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
     float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
     float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-    // Убрали ложные +0.25 и +0.75, возвращаем попиксельную точность DX11
-    //float2 tex_in_3 = d_xy + tex_8; 
 
     float2 tex_LR   = tex_in_3 - float2(d_width, 0.0f);
     float2 tex_TB   = tex_in_3 - float2(0.0f, d_height);
@@ -59,8 +57,8 @@ float4 func_LT(float2 tex_in)
     float k_TB   = GetGray(tex_TB);
     float k_LRTB = GetGray(tex_LRTB);
 
-    int i_x = round((tex_in[0] + 4.0f * d_xy[0]) * width);
-    int i_y = round((tex_in[1] + 4.0f * d_xy[1]) * height);
+    int i_x = round((tex_in + 4.0f * d_xy) * width);
+    int i_y = round((tex_in + 4.0f * d_xy) * height);
     i_x = (i_x % 4) * 2;
     i_y = (i_y % 4) * 2;
 
@@ -78,8 +76,6 @@ float4 func_RT(float2 tex_in)
     float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
     float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
     float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-    // Убрали ложные +0.25 и +0.75, возвращаем попиксельную точность DX11
-    //float2 tex_in_3 = d_xy + tex_8; 
 
     float2 tex_LR   = tex_in_3 + float2(d_width, 0.0f);
     float2 tex_TB   = tex_in_3 - float2(0.0f, d_height);
@@ -91,8 +87,8 @@ float4 func_RT(float2 tex_in)
     float k_TB   = GetGray(tex_TB);
     float k_LRTB = GetGray(tex_LRTB);
 
-    int i_x = round((tex_in[0] + 4.0f * d_xy[0]) * width);
-    int i_y = round((tex_in[1] + 4.0f * d_xy[1]) * height);
+    int i_x = round((tex_in + 4.0f * d_xy) * width);
+    int i_y = round((tex_in + 4.0f * d_xy) * height);
     i_x = (i_x % 4) * 2;
     i_y = (i_y % 4) * 2;
 
@@ -110,8 +106,6 @@ float4 func_RB(float2 tex_in)
     float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
     float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
     float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-    // Убрали ложные +0.25 и +0.75, возвращаем попиксельную точность DX11
-    //float2 tex_in_3 = d_xy + tex_8; 
 
     float2 tex_LR   = tex_in_3 + float2(d_width, 0.0f);
     float2 tex_TB   = tex_in_3 + float2(0.0f, d_height);
@@ -123,8 +117,8 @@ float4 func_RB(float2 tex_in)
     float k_TB   = GetGray(tex_TB);
     float k_LRTB = GetGray(tex_LRTB);
 
-    int i_x = round((tex_in[0] + 4.0f * d_xy[0]) * width);
-    int i_y = round((tex_in[1] + 4.0f * d_xy[1]) * height);
+    int i_x = round((tex_in + 4.0f * d_xy) * width);
+    int i_y = round((tex_in + 4.0f * d_xy) * height);
     i_x = (i_x % 4) * 2;
     i_y = (i_y % 4) * 2;
 
@@ -142,8 +136,6 @@ float4 func_LB(float2 tex_in)
     float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
     float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
     float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-    // Убрали ложные +0.25 и +0.75, возвращаем попиксельную точность DX11
-    //float2 tex_in_3 = d_xy + tex_8; 
 
     float2 tex_LR   = tex_in_3 - float2(d_width, 0.0f);
     float2 tex_TB   = tex_in_3 + float2(0.0f, d_height);
@@ -155,8 +147,8 @@ float4 func_LB(float2 tex_in)
     float k_TB   = GetGray(tex_TB);
     float k_LRTB = GetGray(tex_LRTB);
 
-    int i_x = round((tex_in[0] + 4.0f * d_xy[0]) * width);
-    int i_y = round((tex_in[1] + 4.0f * d_xy[1]) * height);
+    int i_x = round((tex_in + 4.0f * d_xy) * width);
+    int i_y = round((tex_in + 4.0f * d_xy) * height);
     i_x = (i_x % 4) * 2;
     i_y = (i_y % 4) * 2;
 
