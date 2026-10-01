@@ -40,11 +40,20 @@ struct ShaderConstants
     float d_width;   // Шаг одного пикселя по горизонтали (1.0 / width)
     float d_height;  // Шаг одного пикселя по вертикали (1.0 / height)
     float splitX;   // Положение шторки (доля от 0.0 до 1.0)
-    float padding[3]; // Выравнивание структуры в памяти под требования DirectX (кратность 16 байт)
+    float padding;   // Сюда мы запишем наш полупиксельный сдвиг!
+    float macroWidth;  // Сюда запишем ширину макротекстуры (46.0f)
+    float macroHeight; // Сюда запишем высоту макротекстуры (46.0f)
 };
 
+// === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ НЕЗАВИСИМОГО ДИАГНОСТИЧЕСКОГО ОКНА ===
+HWND                     g_hDlgWnd = NULL;             // Дескриптор диагностического окна Windows
+IDXGISwapChain* g_pDlgSwapChain = NULL;       // Цепочка буферов для второго экрана
+ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;// Цель отрисовки диагностического окна
+HRESULT CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
+// ===================================================================
+
 // Прототип функции программной фильтрации на центральном процессоре
-HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixels);
+HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned int height, unsigned int* pOutPixels);
 
 // Глобальный указатель на буфер констант
 ID3D11Buffer* g_pConstantBuffer = NULL;
@@ -85,9 +94,11 @@ ID3D11RenderTargetView* g_pStageDown16RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown16SRV = NULL;
 
 // === НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПРОГРАММНОГО РЕЖИМА (CPU) ===
-bool                      g_bUseCPUProcessing = false; // true - процессор, false - видеокарта
-ID3D11Texture2D* g_pCpuTexture = NULL;        // Промежуточный холст для пикселей от CPU
-ID3D11ShaderResourceView* g_pCpuTextureSRV = NULL;     // Ресурс чтения результата CPU для шторки
+bool                      g_bUseCPUProcessing = false;  // true - процессор, false - видеокарта
+ID3D11Texture2D* g_pCpuTexture = NULL;                  // Промежуточный холст для пикселей от CPU
+ID3D11RenderTargetView* g_pMacroRTV4x4 = NULL;          // Сюда Пасс А будет записывать блоки
+ID3D11ShaderResourceView* g_pMacroSRV4x4 = NULL;        // Отсюда Пасс Б (шейдер) будет читать блоки
+ID3D11ShaderResourceView* g_pCpuTextureSRV = NULL;      // Ресурс чтения результата CPU для шторки
 
 // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
 int                       g_scrollX = 0; // Текущий сдвиг картинки по горизонтали в пикселях
@@ -134,8 +145,9 @@ ID3D11Buffer* g_pVertexBuffer = NULL;     // Буфер геометрии
 
 SimpleVertex g_currentVertices[4];    // Массив вершин, хранящий живую геометрию скроллинга окна
 
-ID3D11ShaderResourceView* g_pTextureSRV = NULL;       // Наша текстура 2х2
-ID3D11SamplerState* g_pSamplerState = NULL;     // Жесткий сэмплер (Point)
+ID3D11ShaderResourceView* g_pTextureSRV = NULL;         // Наша текстура 2х2
+ID3D11Texture2D* g_pMacroTexture4x4 = NULL;             // Сам холст 46х46 в видеопамяти
+ID3D11SamplerState* g_pSamplerState = NULL;             // Жесткий сэмплер (Point)
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
@@ -338,8 +350,30 @@ HRESULT InitDevice(HWND hwnd)
     hr = g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
     if (SUCCEEDED(hr))
     {
-        hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
-        pTexture->Release();
+        // Описываем параметры уменьшенного холста (46х46 для кадра 184)
+        D3D11_TEXTURE2D_DESC macroDesc = {};
+        macroDesc.Width = 46;  // Ровно в 4 раза меньше базовой ширины кадра
+        macroDesc.Height = 46; // Ровно в 4 раза меньше базовой высоты кадра
+        macroDesc.MipLevels = 1;
+        macroDesc.ArraySize = 1;
+        macroDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // Стандартный формат RGBA
+        macroDesc.SampleDesc.Count = 1;
+        macroDesc.Usage = D3D11_USAGE_DEFAULT;
+
+        // КРИТИЧЕСКИЙ ФЛАГ: Разрешаем видеокарте и записывать туда (RTV), и читать из нее (SRV)
+        macroDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        // 1. Физически создаем холст макротекстуры в видеопамяти GPU
+        hr = g_pd3dDevice->CreateTexture2D(&macroDesc, NULL, &g_pMacroTexture4x4);
+
+        if (SUCCEEDED(hr))
+        {
+            hr = g_pd3dDevice->CreateRenderTargetView(g_pMacroTexture4x4, NULL, &g_pMacroRTV4x4);
+            if (SUCCEEDED(hr))
+            {
+                hr = g_pd3dDevice->CreateShaderResourceView(g_pMacroTexture4x4, NULL, &g_pMacroSRV4x4);
+            }
+        }
     }
     if (FAILED(hr)) return hr;
 
@@ -461,6 +495,102 @@ HRESULT InitDevice(HWND hwnd)
     hr = g_pd3dDevice->CreateBuffer(&bd, &InitData, &g_pVertexBuffer);
     if (FAILED(hr)) return hr;
 
+    // === НАЧАЛО АППАРАТНОЙ ИНИЦИАЛИЗАЦИИ ДИАГНОСТИЧЕСКОГО SWAPCHAIN ===
+    if (g_hDlgWnd != NULL && g_pd3dDevice != NULL)
+    {
+        // 1. Описываем параметры вывода для второго окна
+        DXGI_SWAP_CHAIN_DESC sdDlg = {};
+        sdDlg.BufferCount = 1;
+        sdDlg.BufferDesc.Width = 400;  // Ширина нашего диагностического окна
+        sdDlg.BufferDesc.Height = 400; // Высота нашего диагностического окна
+        sdDlg.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sdDlg.BufferDesc.RefreshRate.Numerator = 60;
+        sdDlg.BufferDesc.RefreshRate.Denominator = 1;
+        sdDlg.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sdDlg.OutputWindow = g_hDlgWnd; // НАПРАВЛЯЕМ ВЫВОД СТРОГО ВО ВТОРОЕ ОКНО!
+        sdDlg.SampleDesc.Count = 1;
+        sdDlg.SampleDesc.Quality = 0;
+        sdDlg.Windowed = TRUE;
+
+        // Извлекаем фабрику DXGI из существующего устройства, чтобы создать SwapChain
+        IDXGIDevice* pDXGIDevice = NULL;
+        g_pd3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDXGIDevice);
+
+        IDXGIAdapter* pDXGIAdapter = NULL;
+        if (pDXGIDevice) pDXGIDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&pDXGIAdapter);
+
+        IDXGIFactory* pIDXGIFactory = NULL;
+        if (pDXGIAdapter) pDXGIAdapter->GetParent(__uuidof(IDXGIFactory), (void**)&pIDXGIFactory);
+
+        if (pIDXGIFactory)
+        {
+            // Создаем цепочку буферов для второго окна
+            hr = pIDXGIFactory->CreateSwapChain(g_pd3dDevice, &sdDlg, &g_pDlgSwapChain);
+        }
+
+        // Освобождаем временные интерфейсы DXGI
+        if (pIDXGIFactory) pIDXGIFactory->Release();
+        if (pDXGIAdapter) pDXGIAdapter->Release();
+        if (pDXGIDevice) pDXGIDevice->Release();
+
+        // 2. Создаем цель отрисовки (RenderTargetView) для диагностического окна
+        if (SUCCEEDED(hr) && g_pDlgSwapChain)
+        {
+            ID3D11Texture2D* pBackBufferDlg = NULL;
+            hr = g_pDlgSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBufferDlg);
+
+            if (SUCCEEDED(hr) && pBackBufferDlg)
+            {
+                hr = g_pd3dDevice->CreateRenderTargetView(pBackBufferDlg, NULL, &g_pDlgRenderTargetView);
+                pBackBufferDlg->Release();
+            }
+        }
+    }
+    // === КОНЕЦ АППАРАТНОЙ ИНИЦИАЛИЗАЦИИ ===
+
+        // === АППАРАТНАЯ ИНИЦИАЛИЗАЦИИ ДИАГНОСТИЧЕСКОГО SWAPCHAIN ===
+    if (g_hDlgWnd != NULL && g_pd3dDevice != NULL)
+    {
+        DXGI_SWAP_CHAIN_DESC sdDlg = {};
+        sdDlg.BufferCount = 1;
+        sdDlg.BufferDesc.Width = 400;
+        sdDlg.BufferDesc.Height = 400;
+        sdDlg.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sdDlg.BufferDesc.RefreshRate.Numerator = 60;
+        sdDlg.BufferDesc.RefreshRate.Denominator = 1;
+        sdDlg.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sdDlg.OutputWindow = g_hDlgWnd; // Вывод идет строго во второе окно
+        sdDlg.SampleDesc.Count = 1;
+        sdDlg.SampleDesc.Quality = 0;
+        sdDlg.Windowed = TRUE;
+
+        IDXGIDevice* pDXGIDevice = NULL;
+        g_pd3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDXGIDevice);
+        IDXGIAdapter* pDXGIAdapter = NULL;
+        if (pDXGIDevice) pDXGIDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&pDXGIAdapter);
+        IDXGIFactory* pIDXGIFactory = NULL;
+        if (pDXGIAdapter) pDXGIAdapter->GetParent(__uuidof(IDXGIFactory), (void**)&pIDXGIFactory);
+
+        if (pIDXGIFactory)
+        {
+            hr = pIDXGIFactory->CreateSwapChain(g_pd3dDevice, &sdDlg, &g_pDlgSwapChain);
+        }
+
+        if (pIDXGIFactory) pIDXGIFactory->Release();
+        if (pDXGIAdapter) pDXGIAdapter->Release();
+        if (pDXGIDevice) pDXGIDevice->Release();
+
+        if (SUCCEEDED(hr) && g_pDlgSwapChain)
+        {
+            ID3D11Texture2D* pBackBufferDlg = NULL;
+            hr = g_pDlgSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBufferDlg);
+            if (SUCCEEDED(hr) && pBackBufferDlg)
+            {
+                hr = g_pd3dDevice->CreateRenderTargetView(pBackBufferDlg, NULL, &g_pDlgRenderTargetView);
+                pBackBufferDlg->Release();
+            }
+        }
+    }
     return S_OK;
 }
 
@@ -532,15 +662,23 @@ void Render()
 
     // Заполняем структуру констант для шейдера
     ShaderConstants cbDataLocal = {};
-    cbDataLocal.width = renderW;
-    cbDataLocal.height = renderH;
-    cbDataLocal.d_width = 1.0f / renderW;
-    cbDataLocal.d_height = 1.0f / renderH;
+    cbDataLocal.width = (float)g_currentImgWidth;   // Задаем честный шаг кадра (184.0f)
+    cbDataLocal.height = (float)g_currentImgHeight;  // Задаем честный шаг кадра (184.0f)
+    cbDataLocal.d_width = 1.0f / (float)g_currentImgWidth;
+    cbDataLocal.d_height = 1.0f / (float)g_currentImgHeight;
     cbDataLocal.splitX = 0.5f; // Шторка строго по центру full-size кадра
+    cbDataLocal.padding = 0.5f / (float)g_currentImgWidth;
+    cbDataLocal.macroWidth = (float)g_currentImgWidth / 4.0f;  // Получится 46.0f
+    cbDataLocal.macroHeight = (float)g_currentImgHeight / 4.0f; // Получится 46.0f
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
 
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
+    //g_pImmediateContext->ClearRenderTargetView(g_pMacroRTV4x4, ClearColorBlack);
+    //g_pImmediateContext->OMSetRenderTargets(1, &g_pMacroRTV4x4, NULL);
+    D3D11_VIEWPORT vpStage = { 0.0f, 0.0f, 184.0f, 184.0f, 0.0f, 1.0f };
+    g_pImmediateContext->RSSetViewports(1, &vpStage);
+
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
     g_pImmediateContext->Draw(4, 0);
@@ -555,11 +693,17 @@ void Render()
     g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // t0: Оригинал кадра
 
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);   // t1: Результат дефектоскопа Пасса А!
+
+    D3D11_VIEWPORT vpWin = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
+    g_pImmediateContext->RSSetViewports(1, &vpWin);
+
     if (g_bUseCPUProcessing && g_pCpuTextureSRV) {
         g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV); // t1: Красивый CPU-результат
     }
     else {
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);  // t1: Результат дефектоскопа от GPU
+        //g_pImmediateContext->PSSetShaderResources(1, 1, &g_pMacroSRV4x4);
+        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
     }
     g_pImmediateContext->Draw(4, 0);
 
@@ -625,8 +769,42 @@ void Render()
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
 
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
+    //g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pMacroSRV4x4);
     g_pImmediateContext->Draw(4, 0);
+    /*
+    ID3D11Resource* pMacroRes = NULL;
+    g_pMacroRTV4x4->GetResource(&pMacroRes);
+
+    // Извлекаем текстуру главного экрана (Мастер-Буфера)
+    ID3D11Resource* pBackBufferRes = NULL;
+    g_pRenderTargetView->GetResource(&pBackBufferRes);
+    //g_pStageMasterRTV->GetResource(&pBackBufferRes);
+
+    if (pMacroRes && pBackBufferRes)
+    {
+        // Описываем маленькую область 46х46 в левом верхнем углу экрана
+        D3D11_BOX sourceBox = { 0, 0, 0, 46, 46, 1 };
+
+        // Аппаратно копируем макроматрицу прямо на экран компьютера!
+        g_pImmediateContext->CopySubresourceRegion(
+            pBackBufferRes, 0, 10, 10, 0, // Выводим со сдвигом 10 пикселей от угла
+            pMacroRes, 0, &sourceBox
+        );
+    }
+
+    // Освобождаем временные ссылки, чтобы не вешать память
+    if (pMacroRes) pMacroRes->Release();
+    if (pBackBufferRes) pBackBufferRes->Release();
+    */
+
+    // === ТЕСТОВАЯ ЗАЛИВКА ДИАГНОСТИЧЕСКОГО ОКНА СИНИМ ЦВЕТОМ ===
+    if (g_pDlgRenderTargetView)
+    {
+        float ClearColorBlue[4] = { 0.0f, 0.3f, 0.8f, 1.0f }; // Синий цвет Direct3D
+        g_pImmediateContext->ClearRenderTargetView(g_pDlgRenderTargetView, ClearColorBlue);
+        g_pDlgSwapChain->Present(0, 0); // Выводим кадр во второе окно!
+    }
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pSwapChain->Present(0, 0);
@@ -1185,6 +1363,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
     CreateAppMenu(hwnd); // НОВОЕ: Физически включаем меню на экране сразу после показа окна
 
+    CreateDiagnosticWindow(hInstance, hwnd);
+
     if (FAILED(InitDevice(hwnd)))
     {
         CleanupDevice();
@@ -1322,12 +1502,31 @@ HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned in
             unsigned int idx = y * width + x;
             float src_gray = p1[idx]; // Исходная точка кадра
 
-            // 1. ИНТЕРПОЛЯЦИЯ: Находим координаты текущей точки в укрупненных массивах p2 и p3
-            unsigned int x2 = x / 4;
-            unsigned int y2 = y / 4;
-            if (x2 >= w2) x2 = w2 - 1;
-            if (y2 >= h2) y2 = h2 - 1;
-            float macro_mid = p2[y2 * w2 + x2]; // Средняя яркость блока 4х4
+            // 1. Вычисляем внутриблочный шаг текущего пикселя (от 0 до 3)
+            unsigned int i_x = x % 4;
+            unsigned int i_y = y % 4;
+
+            // Координаты центрального блока 4х4
+            unsigned int x2_0 = x / 4;
+            unsigned int y2_0 = y / 4;
+
+            // Координаты правого и нижнего соседей с защитой от вылета за границы сетки w2/h2
+            unsigned int x2_1 = (x2_0 + 1 < w2) ? x2_0 + 1 : x2_0;
+            unsigned int y2_1 = (y2_0 + 1 < h2) ? y2_0 + 1 : y2_0;
+
+            // Извлекаем яркости четырех смежных макроблоков из пирамиды p2
+            float k_S = p2[y2_0 * w2 + x2_0]; // Центральный
+            float k_LR = p2[y2_0 * w2 + x2_1]; // Справа (сбоку)
+            float k_TB = p2[y2_1 * w2 + x2_0]; // Снизу (вертикаль)
+            float k_LRTB = p2[y2_1 * w2 + x2_1]; // Справа снизу (угол)
+
+            // Масштабируем шаг пикселя под весовые коэффициенты (0, 2, 4, 6)
+            unsigned int idx_x = i_x * 2;
+            unsigned int idx_y = i_y * 2;
+
+            // Вычисляем интерполированное макро-среднее по вашей формуле
+            float macro_mid = ((k_S * (9 + idx_x) + k_LR * (7 - idx_x)) * (9 + idx_y) +
+                (k_TB * (9 + idx_x) + k_LRTB * (7 - idx_x)) * (7 - idx_y)) / 256.0f;
 
             unsigned int x3 = x / 8;
             unsigned int y3 = y / 8;
@@ -1376,6 +1575,59 @@ HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned in
     delete[] p1;
     delete[] p2;
     delete[] p3;
+
+    return S_OK;
+}
+
+// === 1. ОКОННАЯ ПРОЦЕДУРА ДЛЯ ДИАГНОСТИЧЕСКОЙ ПАНЕЛИ ===
+LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_HIDE); // При закрытии просто прячем окно, чтобы не ломать D3D-конвейер
+        return 0;
+    case WM_DESTROY:
+        return 0;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+}
+
+// === 2. ФУНКЦИЯ СОЗДАНИЯ И РЕГИСТРАЦИИ ОКНА ДИАГНОСТИКИ ===
+HRESULT CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
+{
+    // Регистрируем новый класс окна в Windows
+    WNDCLASSEX wcex = {};
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = DiagnosticWndProc;
+    wcex.hInstance = hInstance;
+    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszClassName = L"HDR_Diagnostic_Class";
+
+    if (!RegisterClassEx(&wcex)) return E_FAIL;
+
+    // Вычисляем координаты: сдвигаем новое окно вправо от основного плеера
+    RECT parentRect;
+    GetWindowRect(hParentWnd, &parentRect);
+    int posX = parentRect.right + 10; // 10 пикселей зазор справа
+    int posY = parentRect.top;
+
+    // Физически создаем окно размером 400х400
+    g_hDlgWnd = CreateWindowEx(
+        0, L"HDR_Diagnostic_Class", L"HDR Дефектоскоп — Панель Диагностики",
+        WS_OVERLAPPEDWINDOW,
+        posX, posY, 400, 400,
+        hParentWnd, NULL, hInstance, NULL
+    );
+
+    if (!g_hDlgWnd) return E_FAIL;
+
+    // Показываем диагностическое окно на экране компьютера
+    ShowWindow(g_hDlgWnd, SW_SHOW);
+    UpdateWindow(g_hDlgWnd);
 
     return S_OK;
 }
