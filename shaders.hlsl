@@ -66,7 +66,7 @@ float4 func_LT(float2 tex_in)
     float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (9 + i_y) +
                   (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
 
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float out_gray = saturate(k1 - k_SS + 0.35f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
@@ -96,7 +96,7 @@ float4 func_RT(float2 tex_in)
     float k_SS = ((k_S * (15 - i_x) + k_LR * (1 + i_x)) * (9 + i_y) +
                   (k_TB * (15 - i_x) + k_LRTB * (1 + i_x)) * (7 - i_y)) / 256.0f;
 
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float out_gray = saturate(k1 - k_SS + 0.35f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
@@ -126,7 +126,7 @@ float4 func_RB(float2 tex_in)
     float k_SS = ((k_S * (15 - i_x) + k_LR * (1 + i_x)) * (15 - i_y) +
                   (k_TB * (15 - i_x) + k_LRTB * (1 + i_x)) * (1 + i_y)) / 256.0f;
 
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float out_gray = saturate(k1 - k_SS + 0.35f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
@@ -156,7 +156,7 @@ float4 func_LB(float2 tex_in)
     float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (15 - i_y) +
                   (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (1 + i_y)) / 256.0f;
 
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float out_gray = saturate(k1 - k_SS + 0.35f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
