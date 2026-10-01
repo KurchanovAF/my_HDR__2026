@@ -866,12 +866,31 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     UINT imgWidth = 0, imgHeight = 0;
     pConverter->GetSize(&imgWidth, &imgHeight);
 
-    // Выделяем временный буфер в оперативной памяти компьютера под пиксели
-    UINT* pPixelsBuffer = new UINT[imgWidth * imgHeight];
-    hr = pConverter->CopyPixels(NULL, imgWidth * sizeof(UINT), imgWidth * imgHeight * sizeof(UINT), (BYTE*)pPixelsBuffer);
+    // === НАЧАЛО ИЗМЕНЕНИЯ ===
+    // Вычисляем новые размеры, кратные 8
+    UINT paddedWidth = ((imgWidth + 7) / 8) * 8;
+    UINT paddedHeight = ((imgHeight + 7) / 8) * 8;
+
+    // Выделяем буфер под расширенный кадр и временный под сырые пиксели
+    UINT* pPixelsBuffer = new UINT[paddedWidth * paddedHeight];
+    UINT* pRawPixels = new UINT[imgWidth * imgHeight];
+
+    hr = pConverter->CopyPixels(NULL, imgWidth * sizeof(UINT), imgWidth * imgHeight * sizeof(UINT), (BYTE*)pRawPixels);
 
     if (SUCCEEDED(hr))
     {
+        // Заполняем расширенный буфер с дублированием краев
+        for (UINT y = 0; y < paddedHeight; y++)
+        {
+            UINT srcY = (y < imgHeight) ? y : (imgHeight - 1);
+            for (UINT x = 0; x < paddedWidth; x++)
+            {
+                UINT srcX = (x < imgWidth) ? x : (imgWidth - 1);
+                pPixelsBuffer[y * paddedWidth + x] = pRawPixels[srcY * imgWidth + srcX];
+            }
+        }
+        delete[] pRawPixels; // Удаляем временный сырой буфер
+
         // 6. Если старая основная текстура уже была в памяти — чисто освобождаем её
         if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
 
@@ -888,29 +907,33 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
         D3D11_SUBRESOURCE_DATA initData = {};
         initData.pSysMem = pPixelsBuffer;
-        initData.SysMemPitch = imgWidth * sizeof(UINT);
+        initData.SysMemPitch = paddedWidth * sizeof(UINT); // Задаем видеокарте шаг 184
 
         ID3D11Texture2D* pTexture = NULL;
+        desc.Width = paddedWidth;   // Задаем ширину текстуры 184
+        desc.Height = paddedHeight; // Задаем высоту текстуры 184
         hr = g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
         if (SUCCEEDED(hr))
         {
             hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
             pTexture->Release();
+
+        g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
+        g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
         }
 
         // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
         if (SUCCEEDED(hr))
         {
-            // Выделяем память под массив пикселей, который обработает процессор
-            UINT* pCpuOutPixels = new UINT[imgWidth * imgHeight];
+            UINT* pCpuOutPixels = new UINT[paddedWidth * paddedHeight];
 
-            // Запускаем расчет на процессоре по алгоритмам 2011 года!
-            if (SUCCEEDED(ApplyCpuFilter(pPixelsBuffer, imgWidth, imgHeight, pCpuOutPixels)))
+            // Запускаем расчет на процессоре по НАСТОЯЩЕМУ исходному размеру кадра
+            if (SUCCEEDED(ApplyCpuFilter(pPixelsBuffer, paddedWidth, paddedHeight, pCpuOutPixels)))
             {
-                // Описываем параметры для текстуры процессора
+                // Описываем параметры для текстуры процессора (тоже строго 184х184)
                 D3D11_TEXTURE2D_DESC cpuDesc = {};
-                cpuDesc.Width = imgWidth;
-                cpuDesc.Height = imgHeight;
+                cpuDesc.Width = paddedWidth;
+                cpuDesc.Height = paddedHeight;
                 cpuDesc.MipLevels = 1;
                 cpuDesc.ArraySize = 1;
                 cpuDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -920,7 +943,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
                 D3D11_SUBRESOURCE_DATA cpuInitData = {};
                 cpuInitData.pSysMem = pCpuOutPixels;
-                cpuInitData.SysMemPitch = imgWidth * sizeof(UINT);
+                cpuInitData.SysMemPitch = paddedWidth * sizeof(UINT);
 
                 // Физически создаем холст результатов CPU на видеокарте
                 ID3D11Texture2D* pCpuTex = NULL;
