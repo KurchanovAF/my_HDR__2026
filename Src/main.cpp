@@ -49,7 +49,8 @@ struct ShaderConstants
 HWND                     g_hDlgWnd = NULL;             // Дескриптор диагностического окна Windows
 IDXGISwapChain* g_pDlgSwapChain = NULL;       // Цепочка буферов для второго экрана
 ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;// Цель отрисовки диагностического окна
-HRESULT CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
+void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
+int                      g_diagMode = 1;               // Текущий режим панели: 1, 2, 3 или 4
 // ===================================================================
 
 // Прототип функции программной фильтрации на центральном процессоре
@@ -187,6 +188,120 @@ HRESULT CompileShaderFromFile(const WCHAR* szFileName, LPCSTR szEntryPoint, LPCS
     }
 
     return S_OK;
+}
+
+// === 1. ОКОННАЯ ПРОЦЕДУРА ДЛЯ ДИАГНОСТИЧЕСКОЙ ПАНЕЛИ ===
+LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_COMMAND:
+    {
+        int wmId = LOWORD(wParam);
+        if (wmId >= 2001 && wmId <= 2004)
+        {
+            g_diagMode = wmId - 2000;
+
+            wchar_t titleBuf[128];
+            wsprintf(titleBuf, L"HDR Дефектоскоп — Активен Режим %d", g_diagMode);
+            SetWindowText(hWnd, titleBuf);
+
+            // КРИТИЧЕСКИЙ СИГНАЛ: Заставляем Windows немедленно перерисовать окно при смене режима!
+            InvalidateRect(hWnd, NULL, FALSE);
+            return 0;
+        }
+    }
+    break;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        // Процессор открывает контекст рисования Windows (GDI)
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        // Создаем кисть в зависимости от выбранного режима
+        HBRUSH hBrush = NULL;
+        switch (g_diagMode)
+        {
+        case 1: hBrush = CreateSolidBrush(RGB(0, 0, 0));       // Режим 1 - Черный
+            break;
+        case 2: hBrush = CreateSolidBrush(RGB(150, 0, 0));     // Режим 2 - Красный
+            break;
+        case 3: hBrush = CreateSolidBrush(RGB(0, 120, 30));    // Режим 3 - Зеленый
+            break;
+        case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
+            break;
+        }
+
+        if (hBrush)
+        {
+            // Описываем полезную квадратную область 400х400 под меню
+            RECT rect = { 0, 0, 400, 400 };
+            // Процессор закрашивает окно выбранным цветом
+            FillRect(hdc, &rect, hBrush);
+            DeleteObject(hBrush);
+        }
+
+        // Процессор закрывает рисование
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    break;
+
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        return 0;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+// === 2. САМА ФУНКЦИЯ СОЗДАНИЯ ДИАГНОСТИЧЕСКОГО ОКНА С МЕНЮ ===
+void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
+{
+    WNDCLASSEX wcex = {};
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = DiagnosticWndProc;
+    wcex.hInstance = hInstance;
+    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszClassName = L"HDR_Diagnostic_Class";
+
+    RegisterClassEx(&wcex);
+
+    HMENU hMenuBar = CreateMenu();
+    HMENU hPopupMenu = CreatePopupMenu();
+
+    if (hPopupMenu)
+    {
+        AppendMenu(hPopupMenu, MF_STRING, 2001, L"Режим 1: Макротекстура фона (4х4)");
+        AppendMenu(hPopupMenu, MF_STRING, 2002, L"Режим 2: Карта локальной дисперсии");
+        AppendMenu(hPopupMenu, MF_STRING, 2003, L"Режим 3: Высокочастотная разность (Детали)");
+        AppendMenu(hPopupMenu, MF_STRING, 2004, L"Режим 4: Откорректированный фон (Гамма)");
+    }
+
+    AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hPopupMenu, L"Режимы");
+
+    RECT parentRect;
+    GetWindowRect(hParentWnd, &parentRect);
+    int posX = parentRect.right + 10;
+    int posY = parentRect.top;
+
+    g_hDlgWnd = CreateWindowEx(
+        0, L"HDR_Diagnostic_Class", L"HDR Дефектоскоп — Панель Диагностики",
+        WS_OVERLAPPEDWINDOW,
+        posX, posY, 400, 400,
+        hParentWnd, hMenuBar, hInstance, NULL
+    );
+
+    if (!g_hDlgWnd) return;
+
+    ShowWindow(g_hDlgWnd, SW_SHOW);
+    UpdateWindow(g_hDlgWnd);
 }
 
 // Инициализация видеокарты и создание объектов
@@ -672,12 +787,17 @@ void Render()
     cbDataLocal.macroHeight = (float)g_currentImgHeight / 4.0f; // Получится 46.0f
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
 
-    g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
+    //g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
-    //g_pImmediateContext->ClearRenderTargetView(g_pMacroRTV4x4, ClearColorBlack);
-    //g_pImmediateContext->OMSetRenderTargets(1, &g_pMacroRTV4x4, NULL);
-    D3D11_VIEWPORT vpStage = { 0.0f, 0.0f, 184.0f, 184.0f, 0.0f, 1.0f };
-    g_pImmediateContext->RSSetViewports(1, &vpStage);
+    D3D11_VIEWPORT vpDlg = {};
+    vpDlg.Width = 400.0f;
+    vpDlg.Height = 400.0f; // Полезная квадратная область под матрицы остается 400х400
+    vpDlg.MinDepth = 0.0f;
+    vpDlg.MaxDepth = 1.0f;
+    vpDlg.TopLeftX = 0.0f;
+    vpDlg.TopLeftY = 40.0f; // <== СТРОГО СДВИГАЕМ НАЧАЛО ОТРИСОВКИ ВНИЗ НА 40 ПИКСЕЛЕЙ!
+
+    g_pImmediateContext->RSSetViewports(1, &vpDlg);
 
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
@@ -769,44 +889,10 @@ void Render()
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
     g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
 
-    //g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pMacroSRV4x4);
     g_pImmediateContext->Draw(4, 0);
-    /*
-    ID3D11Resource* pMacroRes = NULL;
-    g_pMacroRTV4x4->GetResource(&pMacroRes);
-
-    // Извлекаем текстуру главного экрана (Мастер-Буфера)
-    ID3D11Resource* pBackBufferRes = NULL;
-    g_pRenderTargetView->GetResource(&pBackBufferRes);
-    //g_pStageMasterRTV->GetResource(&pBackBufferRes);
-
-    if (pMacroRes && pBackBufferRes)
-    {
-        // Описываем маленькую область 46х46 в левом верхнем углу экрана
-        D3D11_BOX sourceBox = { 0, 0, 0, 46, 46, 1 };
-
-        // Аппаратно копируем макроматрицу прямо на экран компьютера!
-        g_pImmediateContext->CopySubresourceRegion(
-            pBackBufferRes, 0, 10, 10, 0, // Выводим со сдвигом 10 пикселей от угла
-            pMacroRes, 0, &sourceBox
-        );
-    }
-
-    // Освобождаем временные ссылки, чтобы не вешать память
-    if (pMacroRes) pMacroRes->Release();
-    if (pBackBufferRes) pBackBufferRes->Release();
-    */
-
-    // === ТЕСТОВАЯ ЗАЛИВКА ДИАГНОСТИЧЕСКОГО ОКНА СИНИМ ЦВЕТОМ ===
-    if (g_pDlgRenderTargetView)
-    {
-        float ClearColorBlue[4] = { 0.0f, 0.3f, 0.8f, 1.0f }; // Синий цвет Direct3D
-        g_pImmediateContext->ClearRenderTargetView(g_pDlgRenderTargetView, ClearColorBlue);
-        g_pDlgSwapChain->Present(0, 0); // Выводим кадр во второе окно!
-    }
-
-    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+    
     g_pSwapChain->Present(0, 0);
 }
 
@@ -1575,59 +1661,6 @@ HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned in
     delete[] p1;
     delete[] p2;
     delete[] p3;
-
-    return S_OK;
-}
-
-// === 1. ОКОННАЯ ПРОЦЕДУРА ДЛЯ ДИАГНОСТИЧЕСКОЙ ПАНЕЛИ ===
-LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message)
-    {
-    case WM_CLOSE:
-        ShowWindow(hWnd, SW_HIDE); // При закрытии просто прячем окно, чтобы не ломать D3D-конвейер
-        return 0;
-    case WM_DESTROY:
-        return 0;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-}
-
-// === 2. ФУНКЦИЯ СОЗДАНИЯ И РЕГИСТРАЦИИ ОКНА ДИАГНОСТИКИ ===
-HRESULT CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
-{
-    // Регистрируем новый класс окна в Windows
-    WNDCLASSEX wcex = {};
-    wcex.cbSize = sizeof(WNDCLASSEX);
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc = DiagnosticWndProc;
-    wcex.hInstance = hInstance;
-    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszClassName = L"HDR_Diagnostic_Class";
-
-    if (!RegisterClassEx(&wcex)) return E_FAIL;
-
-    // Вычисляем координаты: сдвигаем новое окно вправо от основного плеера
-    RECT parentRect;
-    GetWindowRect(hParentWnd, &parentRect);
-    int posX = parentRect.right + 10; // 10 пикселей зазор справа
-    int posY = parentRect.top;
-
-    // Физически создаем окно размером 400х400
-    g_hDlgWnd = CreateWindowEx(
-        0, L"HDR_Diagnostic_Class", L"HDR Дефектоскоп — Панель Диагностики",
-        WS_OVERLAPPEDWINDOW,
-        posX, posY, 400, 400,
-        hParentWnd, NULL, hInstance, NULL
-    );
-
-    if (!g_hDlgWnd) return E_FAIL;
-
-    // Показываем диагностическое окно на экране компьютера
-    ShowWindow(g_hDlgWnd, SW_SHOW);
-    UpdateWindow(g_hDlgWnd);
 
     return S_OK;
 }
