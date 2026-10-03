@@ -115,6 +115,7 @@ UINT                      g_currentImgHeight = 0;
 // === ГЛОБАЛЬНЫЕ РАЗМЕРЫ КЛИЕНТСКОЙ ОБЛАСТИ ОКНА ===
 float                     g_wndW = 800.0f; // Стартовая ширина окна по умолчанию
 float                     g_wndH = 600.0f; // Стартовая высота окна по умолчанию
+D3D11_VIEWPORT           vpWin = { 0.0f, 0.0f, 800.0f, 600.0f, 0.0f, 1.0f };
 
 // === ГЛОБАЛЬНЫЕ ДОЛИ ПРОКРУТКИ КАДРА (ОТ 0.0 ДО 1.0) ===
 float                     g_scrollRatioX = 0.0f;
@@ -860,6 +861,7 @@ HRESULT InitDevice(HWND hwnd)
 // ПОЛНОЦЕННАЯ СИНХРОНИЗИРОВАННАЯ ФУНКЦИЯ ОТРИСОВКИ С АВТОМАТИЧЕСКИМ СКРОЛЛИНГОМ И СОХРАНЕНИЕМ ПРОПОРЦИЙ
 // УТРЕННЯЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ С УМНЫМ ПОРТОМ ПРОСМОТРА
 // ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
+/*
 void Render()
 {
     // ЖЕСТКИЙ ЗАМОК БЕЗОПАСНОСТИ: Не пускаем видеокарту рендерить, пока не загружен файл
@@ -968,7 +970,7 @@ void Render()
 
     g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);   // t1: Результат дефектоскопа Пасса А!
 
-    D3D11_VIEWPORT vpWin = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
+    vpWin = { 0.0f, 0.0f, (float)g_currentImgWidth, (float)g_currentImgHeight, 0.0f, 1.0f };
     g_pImmediateContext->RSSetViewports(1, &vpWin);
 
     if (g_bUseCPUProcessing && g_pCpuTextureSRV) {
@@ -1047,8 +1049,72 @@ void Render()
     
     g_pSwapChain->Present(0, 0);
 }
+*/
 
 // === НОВЫЙ БЕЗОПАСНЫЙ КОД: ФУНКЦИЯ ДВУХЭКРАННОГО ВЫВОДА "ДО / ПОСЛЕ" ===
+void Render()
+{
+    // 1. Проверяем базовые системные дескрипторы
+    if (!g_pImmediateContext) {
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет контекста устройства (g_pImmediateContext).");
+        return;
+    }
+    if (!g_pRenderTargetView) {
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет главного буфера экрана (g_pRenderTargetView).");
+        return;
+    }
+    if (!g_pSwapChain) {
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет SwapChain.");
+        return;
+    }
+
+    // 2. Очищаем холст
+    float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
+
+    // 3. Проверяем текстуру оригинала
+    if (!g_pTextureSRV) {
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Текстура оригинала g_pTextureSRV равна NULL!");
+        return;
+    }
+
+    // 4. Проверяем финальный шейдер
+    if (!g_pPixelShaderFinal) {
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Финальный шейдер g_pPixelShaderFinal не загружен!");
+        return;
+    }
+
+    // 5. Настраиваем геометрию и выполняем отрисовку
+    vpWin.Width = g_wndW;
+    vpWin.Height = g_wndH;
+    vpWin.TopLeftX = 0.0f;
+    vpWin.TopLeftY = 0.0f;
+    g_pImmediateContext->RSSetViewports(1, &vpWin);
+
+    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+
+    g_pImmediateContext->Draw(4, 0);
+
+    // 6. Выводим кадр и проверяем результат команды Present
+    HRESULT hrPresent = g_pSwapChain->Present(0, 0);
+    if (FAILED(hrPresent))
+    {
+        wchar_t errBuf[128];
+        wsprintf(errBuf, L"Аппаратный сбой Present! Код ошибки: 0x%08X", hrPresent);
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)errBuf);
+    }
+    else
+    {
+        // Если видеокарта отработала честно — подтверждаем это в строке статуса
+        wchar_t okBuf[128];
+        wsprintf(okBuf, L"Кадр 4128х3096 отправлен на GPU. Ошибка отрисовки отсутствует. Проверьте шейдер.");
+        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)okBuf);
+    }
+}
+
+
 void RenderSplit()
 {
     if (g_pRenderTargetView == NULL) return;
@@ -1939,23 +2005,44 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_SIZE:
     {
-        // 1. Получаем полные физические размеры окна
+        // 1. Измеряем реальные физические размеры окна
         g_wndW = (float)LOWORD(lParam);
         g_wndH = (float)HIWORD(lParam);
 
+        // Обновляем положение строки статуса, передавая живые параметры
         if (g_hStatusWnd != NULL)
         {
             SendMessage(g_hStatusWnd, WM_SIZE, wParam, lParam);
+
+            // Получаем высоту статус-бара, чтобы ползунки сели строго НАД ним
+            RECT rS = {};
+            GetWindowRect(g_hStatusWnd, &rS);
+            g_wndH -= (float)(rS.bottom - rS.top);
+        }
+
+        // === НАЧАЛО ОДНОГО КОРОТКОГО ШАГА: ЛОГИКА МАСШТАБИРОВАНИЯ ИЗ КОММИТА ===
+        // Если выбран режим "Вписать в окно" (по умолчанию)
+        if (g_bFitToWindow)
+        {
+            // В режиме "Вписать в окно" настраиваем вьюпорт vpWin под текущие размеры рамы экрана
+            vpWin.Width = g_wndW;
+            vpWin.Height = g_wndH;
+            vpWin.TopLeftX = 0.0f;
+            vpWin.TopLeftY = 0.0f;
+        }
+        else
+        {
+            // В режиме 1:1 фиксируем вьюпорт vpWin под реальные 12 мегапикселей кадра
+            vpWin.Width = (float)g_currentImgWidth;
+            vpWin.Height = (float)g_currentImgHeight;
         }
 
         if (g_pSwapChain)
         {
-            // Видеокарта пересчитает буфер кадра строго ДО строки статуса!
-            g_pSwapChain->ResizeBuffers(0, (UINT)g_wndW, (UINT)g_wndH, DXGI_FORMAT_UNKNOWN, 0);
-            
+            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+
             ID3D11Texture2D* pBackBuffer = NULL;
             g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
-
             if (pBackBuffer) {
                 g_pd3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_pRenderTargetView);
                 pBackBuffer->Release();
@@ -1963,6 +2050,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
     }
     break;
+
 
 
 
