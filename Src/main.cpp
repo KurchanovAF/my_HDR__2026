@@ -2,7 +2,8 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <cmath> // ИСПРАВЛЕНИЕ: Подключили математические функции sqrt и pow для CPU
-
+#include <commctrl.h>                                  // Системная библиотека элементов управления Windows
+#pragma comment(lib, "comctl32.lib")                   // Автоматическая линковка библиотеки
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -46,11 +47,15 @@ struct ShaderConstants
 };
 
 // === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ НЕЗАВИСИМОГО ДИАГНОСТИЧЕСКОГО ОКНА ===
-HWND                     g_hDlgWnd = NULL;             // Дескриптор диагностического окна Windows
-IDXGISwapChain* g_pDlgSwapChain = NULL;       // Цепочка буферов для второго экрана
-ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;// Цель отрисовки диагностического окна
+HWND                     g_hDlgWnd = NULL;              // Дескриптор диагностического окна Windows
+HWND                     g_hStatusWnd = NULL;           // Дескриптор строки статуса внизу плеера
+HWND                     g_hDlgStatusWnd = NULL;        // Строка статуса диагностического окна панели
+IDXGISwapChain* g_pDlgSwapChain = NULL;                 // Цепочка буферов для второго экрана
+ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;  // Цель отрисовки диагностического окна
 void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
-int                      g_diagMode = 1;               // Текущий режим панели: 1, 2, 3 или 4
+int                      g_diagMode = 1;                // Текущий режим панели: 1, 2, 3 или 4
+ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
+ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточная текстура для оригинала кадра
 // ===================================================================
 
 // Прототип функции программной фильтрации на центральном процессоре
@@ -223,8 +228,119 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         HBRUSH hBrush = NULL;
         switch (g_diagMode)
         {
-        case 1: hBrush = CreateSolidBrush(RGB(0, 0, 0));       // Режим 1 - Черный
-            break;
+        case 0:
+        {
+            // Очищаем фон в черный цвет перед выводом
+            HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+            RECT rCtx = { 0, 0, 400, 400 };
+            FillRect(hdc, &rCtx, hBg);
+            DeleteObject(hBg);
+
+            // Проверяем, что видеокарта или процессор хранят текстуру в памяти
+            // Если у вас буфер называется по-другому (например, g_pBits), заменим на него!
+            if (g_pImmediateContext && g_pTextureSRV)
+            {
+                // Чтобы не зависеть от скрытых массивов, процессор может прочитать 
+                // исходный кадр прямо из базовой текстуры t0 через тот же Map-механизм!
+                D3D11_MAPPED_SUBRESOURCE mappedTexture = {};
+
+                // Извлекаем саму текстуру оригинала из её ресурса SRV
+                ID3D11Resource* pRes = NULL;
+                g_pTextureSRV->GetResource(&pRes);
+
+                if (pRes)
+                {
+                    HRESULT hrMap = g_pImmediateContext->Map(pRes, 0, D3D11_MAP_READ, 0, &mappedTexture);
+                    if (SUCCEEDED(hrMap) && mappedTexture.pData)
+                    {
+                        DWORD* pSrcPixels = (DWORD*)mappedTexture.pData;
+                        UINT stride = mappedTexture.RowPitch / sizeof(DWORD);
+
+                        // Выводим исходную картинку, масштабируя её в окно 400х400
+                        // Обходим сетку 184х184 пикселя (размер вашего кадра)
+                        for (UINT y = 0; y < 184; y++)
+                        {
+                            for (UINT x = 0; x < 184; x++)
+                            {
+                                DWORD color = pSrcPixels[y * stride + x];
+                                BYTE r = (BYTE)(color & 0xFF);
+                                BYTE g = (BYTE)((color >> 8) & 0xFF);
+                                BYTE b = (BYTE)((color >> 16) & 0xFF);
+
+                                // Рисуем пиксель на экране (смещаем вниз на 40 от меню)
+                                // Чтобы картинка заняла экран, укрупняем пиксель в 2 раза!
+                                HBRUSH hPxlBrush = CreateSolidBrush(RGB(r, g, b));
+                                RECT pxlRect = { (int)x * 2, (int)y * 2 + 40, (int)(x + 1) * 2, (int)(y + 1) * 2 + 40 };
+                                FillRect(hdc, &pxlRect, hPxlBrush);
+                                DeleteObject(hPxlBrush);
+                            }
+                        }
+                        g_pImmediateContext->Unmap(pRes, 0);
+                    }
+                    pRes->Release();
+                }
+            }
+        }
+        break;
+        case 1:
+        {
+            // 1. По умолчанию очищаем фон в строгий черный цвет
+            HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+            RECT rCtx = { 0, 0, 400, 400 };
+            FillRect(hdc, &rCtx, hBg);
+            DeleteObject(hBg);
+
+            // 2. Если видеокарта подготовила данные — вскрываем буфер-шпион!
+            if (g_pImmediateContext && g_pMacroStaging)
+            {
+                D3D11_MAPPED_SUBRESOURCE mappedResource = {};
+
+                // Открываем шлюз памяти для безопасного чтения процессором
+                HRESULT hrMap = g_pImmediateContext->Map(g_pMacroStaging, 0, D3D11_MAP_READ, 0, &mappedResource);
+
+                if (SUCCEEDED(hrMap) && mappedResource.pData)
+                {
+                    // Приводим указатель к системному типу пикселей (RGBA)
+                    DWORD* pBufferPixels = (DWORD*)mappedResource.pData;
+
+                    // Вычисляем шаг строки в элементах DWORD (Pitch в байтах / 4)
+                    UINT strideDWORD = mappedResource.RowPitch / sizeof(DWORD);
+
+                    // Запускаем двойной цикл процессора по матрице блоков 46х46
+                    for (UINT y = 0; y < 46; y++)
+                    {
+                        for (UINT x = 0; x < 46; x++)
+                        {
+                            // Считываем точный RGBA цвет текущего макроблока 4х4
+                            DWORD rawColor = pBufferPixels[y * strideDWORD + x];
+
+                            // Раскладываем байты цвета на стандартные каналы Windows GDI
+                            BYTE r = (BYTE)(rawColor & 0xFF);
+                            BYTE g = (BYTE)((rawColor >> 8) & 0xFF);
+                            BYTE b = (BYTE)((rawColor >> 16) & 0xFF);
+
+                            // Создаем персональную кисть цвета этого блока
+                            HBRUSH hBlockBrush = CreateSolidBrush(RGB(r, g, b));
+
+                            // Масштабируем: рисуем каждый блок крупным квадратом 8х8 пикселей!
+                            // Смещаем на 40 пикселей вниз, чтобы не затереть меню "Режимы"!
+                            RECT blockRect;
+                            blockRect.left = x * 8;
+                            blockRect.right = (x + 1) * 8;
+                            blockRect.top = y * 8 + 40;
+                            blockRect.bottom = (y + 1) * 8 + 40;
+
+                            FillRect(hdc, &blockRect, hBlockBrush);
+                            DeleteObject(hBlockBrush);
+                        }
+                    }
+
+                    // Обязательно закрываем шлюз видеопамяти!
+                    g_pImmediateContext->Unmap(g_pMacroStaging, 0);
+                }
+            }
+        }
+        break;
         case 2: hBrush = CreateSolidBrush(RGB(150, 0, 0));     // Режим 2 - Красный
             break;
         case 3: hBrush = CreateSolidBrush(RGB(0, 120, 30));    // Режим 3 - Зеленый
@@ -278,6 +394,8 @@ void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
 
     if (hPopupMenu)
     {
+
+        AppendMenu(hPopupMenu, MF_STRING, 2000, L"Режим 0: Исходный кадр (Оригинал)");
         AppendMenu(hPopupMenu, MF_STRING, 2001, L"Режим 1: Макротекстура фона (4х4)");
         AppendMenu(hPopupMenu, MF_STRING, 2002, L"Режим 2: Карта локальной дисперсии");
         AppendMenu(hPopupMenu, MF_STRING, 2003, L"Режим 3: Высокочастотная разность (Детали)");
@@ -299,6 +417,13 @@ void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
     );
 
     if (!g_hDlgWnd) return;
+
+    g_hDlgStatusWnd = CreateStatusWindow(
+        WS_CHILD | WS_VISIBLE,                   // Стандартные стили из нашего эталона 2004 года!
+        L"Диагностика активна. Ожидание кадра.",  // Стартовый текст для правого окна
+        g_hDlgWnd,                               // Родительское окно (наша панель диагностики)
+        2006                                     // Уникальный ID второго статус-бара
+    );
 
     ShowWindow(g_hDlgWnd, SW_SHOW);
     UpdateWindow(g_hDlgWnd);
@@ -489,6 +614,23 @@ HRESULT InitDevice(HWND hwnd)
                 hr = g_pd3dDevice->CreateShaderResourceView(g_pMacroTexture4x4, NULL, &g_pMacroSRV4x4);
             }
         }
+
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width = 46;  // Размер строго совпадает с нашей матрицей макроблоков
+        stagingDesc.Height = 46;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // Стандартный формат RGBA кадра
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.SampleDesc.Quality = 0;
+
+        // Настраиваем специальный режим передачи данных из видеокарты в процессор:
+        stagingDesc.Usage = D3D11_USAGE_STAGING;             // Режим инспекционного буфера
+        stagingDesc.BindFlags = 0;                           // К шейдерам этот буфер не привязывается
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;  // РАЗРЕШАЕМ ПРОЦЕССОРУ ЧИТАТЬ ЭТИ БАЙТЫ!
+
+        // Физически создаем текстуру-шпион в памяти GPU
+        hr = g_pd3dDevice->CreateTexture2D(&stagingDesc, NULL, &g_pMacroStaging);
     }
     if (FAILED(hr)) return hr;
 
@@ -787,17 +929,8 @@ void Render()
     cbDataLocal.macroHeight = (float)g_currentImgHeight / 4.0f; // Получится 46.0f
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
 
-    //g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
-    D3D11_VIEWPORT vpDlg = {};
-    vpDlg.Width = 400.0f;
-    vpDlg.Height = 400.0f; // Полезная квадратная область под матрицы остается 400х400
-    vpDlg.MinDepth = 0.0f;
-    vpDlg.MaxDepth = 1.0f;
-    vpDlg.TopLeftX = 0.0f;
-    vpDlg.TopLeftY = 40.0f; // <== СТРОГО СДВИГАЕМ НАЧАЛО ОТРИСОВКИ ВНИЗ НА 40 ПИКСЕЛЕЙ!
-
-    g_pImmediateContext->RSSetViewports(1, &vpDlg);
+    g_pImmediateContext->RSSetViewports(1, &vpS3);
 
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
@@ -806,6 +939,26 @@ void Render()
     // Чисто разрываем связи Пасса А
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
+
+    if (g_pMacroStaging && g_pMacroTexture4x4)
+    {
+        // Делаем моментальный слепок боевой матрицы для процессора
+        g_pImmediateContext->CopyResource(g_pMacroStaging, g_pMacroTexture4x4);
+    }
+
+    if (g_pTextureStaging && g_pTextureSRV)
+    {
+        // Извлекаем саму текстуру оригинала из её ресурса SRV
+        ID3D11Resource* pSrcRes = NULL;
+        g_pTextureSRV->GetResource(&pSrcRes);
+
+        if (pSrcRes)
+        {
+            // Видеокарта аппаратно копирует оригинальный кадр в буфер-шпион!
+            g_pImmediateContext->CopyResource(g_pTextureStaging, pSrcRes);
+            pSrcRes->Release();
+        }
+    }
 
     // Пасс Б: Сборка финальной шторки "До / После" в Полноразмерный Мастер-Буфер
     g_pImmediateContext->ClearRenderTargetView(g_pStageMasterRTV, ClearColorBlack);
@@ -822,8 +975,7 @@ void Render()
         g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV); // t1: Красивый CPU-результат
     }
     else {
-        //g_pImmediateContext->PSSetShaderResources(1, 1, &g_pMacroSRV4x4);
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pTextureSRV);
     }
     g_pImmediateContext->Draw(4, 0);
 
@@ -1177,6 +1329,11 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
         desc.Width = paddedWidth;   // Задаем ширину текстуры 184
         desc.Height = paddedHeight; // Задаем высоту текстуры 184
         hr = g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
+        if (SUCCEEDED(hr) && g_pTextureStaging && pTexture)
+        {
+            // Видеокарта делает моментальный слепок оригинального кадра в наш шпион со всеми нужными флагами!
+            g_pImmediateContext->CopyResource(g_pTextureStaging, pTexture);
+        }
         if (SUCCEEDED(hr))
         {
             hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
@@ -1416,7 +1573,7 @@ bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
     if (GetOpenFileNameW(&ofn))
     {
         // Если пользователь выбрал файл и нажал "Открыть" — копируем путь в нашу глобальную переменную
-        wcscpy_s(g_szSelectedFilePath, MAX_PATH, ofn.lpstrFile);
+        wcscpy_s(g_szSelectedFilePath, MAX_PATH, szFile);
         return true;
     }
 
@@ -1438,13 +1595,51 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClass(&wc);
 
-    HWND hwnd = CreateWindowEx(0, CLASS_NAME, L"Мой Шейдерный Видеоплеер",
-        WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL, 
-        CW_USEDEFAULT, CW_USEDEFAULT, 
-        800, 600, 
-        NULL, NULL, hInstance, NULL);
+    HWND hwnd = CreateWindowW(
+        CLASS_NAME,                  // Строка 1591: Ваша живая переменная класса со строки 1582!
+        L"Мой Шейдерный Видеоплеер", // Строка 1592: Заголовок плеера в кавычках напрямую
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, // Ваши родные стили встроенных ползунков
+        CW_USEDEFAULT,
+        0,
+        800,
+        600,
+        NULL,
+        NULL,
+        hInstance,
+        NULL
+    );
 
     if (hwnd == NULL) return 0;
+
+    // Инициализируем общие элементы управления Windows
+    InitCommonControls();
+
+    // Физически создаем строку статуса, привязанную к главному окну hwnd
+    g_hStatusWnd = CreateStatusWindow(
+        WS_CHILD | WS_VISIBLE,
+        L"HDR Дефектоскоп готов к работе",
+        hwnd,                                 // Дескриптор вашего окна плеера
+        2005
+    );
+
+    if (g_hStatusWnd != NULL && hwnd != NULL)
+    {
+        // 1. Аппаратно измеряем физическую высоту созданной строки статуса (как в 2004 году!)
+        RECT rS = {};
+        GetWindowRect(g_hStatusWnd, &rS);
+        int statusHeight = rS.bottom - rS.top; // Получили чистую высоту полосы в пикселях
+
+        // 2. Узнаем текущие полные габариты рамы главного окна плеера на экране
+        RECT wndRect = {};
+        GetWindowRect(hwnd, &wndRect);
+        int currentW = wndRect.right - wndRect.left;
+        int currentH = wndRect.bottom - wndRect.top;
+
+        // 3. Расширяем внешнюю коробку окна строго на высоту статус-бара!
+        // Плеер остаётся в своих прежних размерах, а строка статуса ложится ниже ползунков!
+        SetWindowPos(hwnd, NULL, 0, 0, currentW, currentH + statusHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+
     ShowWindow(hwnd, nCmdShow);
 
     CreateAppMenu(hwnd); // НОВОЕ: Физически включаем меню на экране сразу после показа окна
@@ -1744,22 +1939,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_SIZE:
     {
-        // Получаем новые физические размеры клиентской области окна из lParam
+        // 1. Получаем полные физические размеры окна
         g_wndW = (float)LOWORD(lParam);
         g_wndH = (float)HIWORD(lParam);
 
-        // Если DirectX уже инициализирован — обновляем системный SwapChain буфер экрана
+        if (g_hStatusWnd != NULL)
+        {
+            SendMessage(g_hStatusWnd, WM_SIZE, wParam, lParam);
+        }
+
         if (g_pSwapChain)
         {
-            // Сбрасываем старый RenderTargetView, чтобы Windows разрешила изменить размер буферов
-            if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
-
-            // Раздвигаем внутренний буфер DirectX под новый размер окна
+            // Видеокарта пересчитает буфер кадра строго ДО строки статуса!
             g_pSwapChain->ResizeBuffers(0, (UINT)g_wndW, (UINT)g_wndH, DXGI_FORMAT_UNKNOWN, 0);
-
-            // Пересоздаем взгляд на экран под новые габариты
+            
             ID3D11Texture2D* pBackBuffer = NULL;
             g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+
             if (pBackBuffer) {
                 g_pd3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_pRenderTargetView);
                 pBackBuffer->Release();
@@ -1894,7 +2090,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     // Принудительно вызываем Render прямо сейчас, 
                     // чтобы протолкнуть новые SRV-интерфейсы в GPU!
                     Render();
+                    wchar_t statusBuf[256];
+
+                    // Подставляем ваши глобальные переменные ширины и высоты кадра плеера
+                    wsprintf(statusBuf, L"Файл успешно загружен. Габариты кадра: %d x %d пикселей.", g_currentImgWidth, g_currentImgHeight);
+
+                    // Отправляем этот текст в нижний статус-бар!
+                    SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)statusBuf);
                     //RenderSplit(); // Переключили плеер в режим сравнения "До / После"
+                    MessageBoxW(hwnd, L"Удалось декодировать файл изображения через WIC.", L"НЕТ ОШИБОК", MB_OK | MB_ICONERROR);
                 }
                 else
                 {

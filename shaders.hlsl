@@ -214,22 +214,12 @@ float4 func_LB(float2 tex_in, float4 screen_pos)
 float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 {
     float2 tex0 = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
-    
-    // Получаем чистый, неплывущий номер макроблока 4х4 через целые числа экрана
+ 
     int block_x = int(input.Pos.x) / 4;
     int block_y = int(input.Pos.y) / 4;
 
-    // Жестко и без сбоев округления выбираем нужную функцию зоны
-    if (block_x % 2 == 0)
-    {
-        if (block_y % 2 == 0) return func_LT(tex0, input.Pos);
-        else return func_LB(tex0, input.Pos);
-    }
-    else
-    {
-        if (block_y % 2 == 0) return func_RT(tex0, input.Pos);
-        else return func_RB(tex0, input.Pos);
-    }
+    // === МЫ ВСЁ СТЁРЛИ И ВСТАВИЛИ ТОЛЬКО ЭТУ ОДНУ СТРОЧКУ ТЕСТА ===
+    return srcTexture.Sample(samplerState0, input.Tex);
 }
 
 // ШЕЙДЕР СКВОЗНОГО КОПИРОВАНИЯ ЭКРАНА С УЧЕТОМ ШТОРКИ ДО/ПОСЛЕ
