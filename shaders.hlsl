@@ -223,26 +223,19 @@ float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 }
 
 // ШЕЙДЕР СКВОЗНОГО КОПИРОВАНИЯ ЭКРАНА С УЧЕТОМ ШТОРКИ ДО/ПОСЛЕ
-//Texture2D statsTexture : register(t1); // Сюда подадим готовый фильтр из Stage3
+Texture2D filterTexture : register(t1); // Сюда большой Render подает g_pStage3SRV
 
 float4 PS_Final(VS_OUTPUT input) : SV_Target
 {
-    // Берем оригинальную текстуру из чистого слота t0
-    float4 color = srcTexture.Sample(samplerState0, input.Tex);
-
-    // Рисуем шторку разделения экрана
     if (input.Tex.x < splitX)
     {
-        // Левая половина: переводим оригинал в монохром по вашим весам
-        float gray = dot(color.rgb, WEIGHT);
+        float gray = dot(srcTexture.Sample(samplerState0, input.Tex).rgb, WEIGHT);
         return float4(gray, gray, gray, 1.0f);
     }
-    
-    // Тонкая разделительная черная линия
     if (abs(input.Tex.x - splitX) < 0.0015f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
-
-    // Правая половина: временно выводим тот же кадр в цвете для проверки прохода
-    return color;
+    
+    // Возвращаем результат обработки с правого слота t1
+    return filterTexture.Sample(samplerState0, input.Tex);
 }
 
 

@@ -46,6 +46,9 @@ struct ShaderConstants
     float macroHeight; // Сюда запишем высоту макротекстуры (46.0f)
 };
 
+// === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
+HWND hwnd;
+
 // === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ НЕЗАВИСИМОГО ДИАГНОСТИЧЕСКОГО ОКНА ===
 HWND                     g_hDlgWnd = NULL;              // Дескриптор диагностического окна Windows
 HWND                     g_hStatusWnd = NULL;           // Дескриптор строки статуса внизу плеера
@@ -57,6 +60,9 @@ int                      g_diagMode = 1;                // Текущий реж
 ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
 ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточная текстура для оригинала кадра
 // ===================================================================
+bool g_bNeedsUpdate = true;                             // По умолчанию true, чтобы плеер отрисовал самый первый кадр при старте
+HMENU g_hZoomSubMenu = NULL;                            // Глобальный дескриптор для подменю масштабов
+void UpdateZoomMenuCheck(int checkedId);
 
 // Прототип функции программной фильтрации на центральном процессоре
 HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned int height, unsigned int* pOutPixels);
@@ -204,15 +210,30 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
     case WM_COMMAND:
     {
         int wmId = LOWORD(wParam);
-        if (wmId >= 2001 && wmId <= 2004)
+        // Диапазон пунктов от 2000 (Режим 0) до 2004 (Режим 4)
+        if (wmId >= 2000 && wmId <= 2004)
         {
             g_diagMode = wmId - 2000;
+
+            // Получаем доступ к меню панели диагностики
+            HMENU hMenuBar = GetMenu(hWnd);
+            if (hMenuBar) {
+                HMENU hPopupMenu = GetSubMenu(hMenuBar, 0); // Берем самое первое выпадающее подменю "Режимы"
+                if (hPopupMenu) {
+                    // Снимаем галочки со всех пяти режимов панели
+                    for (int id = 2000; id <= 2004; id++) {
+                        CheckMenuItem(hPopupMenu, id, MF_BYCOMMAND | MF_UNCHECKED);
+                    }
+                    // Ставим галочку на выбранный режим
+                    CheckMenuItem(hPopupMenu, wmId, MF_BYCOMMAND | MF_CHECKED);
+                }
+            }
 
             wchar_t titleBuf[128];
             wsprintf(titleBuf, L"HDR Дефектоскоп — Активен Режим %d", g_diagMode);
             SetWindowText(hWnd, titleBuf);
 
-            // КРИТИЧЕСКИЙ СИГНАЛ: Заставляем Windows немедленно перерисовать окно при смене режима!
+            g_bNeedsUpdate = true; // Заодно взводим наш флаг, чтобы обновить расчеты кадра!
             InvalidateRect(hWnd, NULL, FALSE);
             return 0;
         }
@@ -412,7 +433,7 @@ void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
 
     g_hDlgWnd = CreateWindowEx(
         0, L"HDR_Diagnostic_Class", L"HDR Дефектоскоп — Панель Диагностики",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         posX, posY, 400, 400,
         hParentWnd, hMenuBar, hInstance, NULL
     );
@@ -427,6 +448,20 @@ void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
     );
 
     ShowWindow(g_hDlgWnd, SW_SHOW);
+
+    if (g_hDlgWnd)
+    {
+        HMENU hDlgMenu = GetMenu(g_hDlgWnd);
+        if (hDlgMenu)
+        {
+            HMENU hModesMenu = GetSubMenu(hDlgMenu, 0); // Самое первое выпадающее меню "Режимы"
+            if (hModesMenu)
+            {
+                // Ставим галочку на "Режим 0: Исходный кадр" сразу при создании окна
+                CheckMenuItem(hModesMenu, 2000, MF_BYCOMMAND | MF_CHECKED);
+            }
+        }
+    }
     UpdateWindow(g_hDlgWnd);
 }
 
@@ -861,149 +896,107 @@ HRESULT InitDevice(HWND hwnd)
 // ПОЛНОЦЕННАЯ СИНХРОНИЗИРОВАННАЯ ФУНКЦИЯ ОТРИСОВКИ С АВТОМАТИЧЕСКИМ СКРОЛЛИНГОМ И СОХРАНЕНИЕМ ПРОПОРЦИЙ
 // УТРЕННЯЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ С УМНЫМ ПОРТОМ ПРОСМОТРА
 // ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
-/*
 void Render()
 {
-    // ЖЕСТКИЙ ЗАМОК БЕЗОПАСНОСТИ: Не пускаем видеокарту рендерить, пока не загружен файл
-    if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL || g_pStageMasterRTV == NULL) return;
+    if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL) return;
+    
+    RECT rcClient;
+    if (hwnd && GetClientRect(hwnd, &rcClient))
+    {
+        g_wndW = (float)(rcClient.right - rcClient.left);
+        g_wndH = (float)(rcClient.bottom - rcClient.top);
+    }
 
-    // 1. Настройка общих параметров сетки вершин
+    // Защита от нулевых размеров (если окно свёрнуто)
+    if (g_wndW <= 0.0f || g_wndH <= 0.0f) { g_wndW = 800.0f; g_wndH = 600.0f; }
+
+    // ОБЯЗАТЕЛЬНО: Настройка общих параметров сетки вершин (вызывается всегда)
     UINT stride = sizeof(SimpleVertex);
     UINT offset = 0;
     g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &stride, &offset);
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-
-    // Привязываем базовые шейдеры и постоянные ресурсы конвейера
+    g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
     g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
-    g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
-    g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState);
 
-    // Локальные переменные и цвета очистки буферов
     ID3D11ShaderResourceView* nullSRV[] = { NULL };
     ID3D11RenderTargetView* nullRTV[] = { NULL };
     float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
 
-    // Автоматически и безопасно получаем точные размеры загруженного файла напрямую из текстуры
-    UINT fileWidth = 32, fileHeight = 32;
-    if (g_pTextureSRV) {
-        ID3D11Resource* pRes = NULL;
-        g_pTextureSRV->GetResource(&pRes);
-        if (pRes) {
-            ID3D11Texture2D* pTex2D = (ID3D11Texture2D*)pRes;
-            D3D11_TEXTURE2D_DESC tDesc;
-            pTex2D->GetDesc(&tDesc);
-            fileWidth = tDesc.Width;
-            fileHeight = tDesc.Height;
-            pRes->Release();
-        }
-    }
+    UINT fileWidth = g_currentImgWidth;
+    UINT fileHeight = g_currentImgHeight;
     float renderW = (float)fileWidth;
     float renderH = (float)fileHeight;
 
     // ========================================================================
-    // ЭТАП I: ОДНОПРОХОДНЫЙ РАСЧЕТ И СБОРКА ШТОРКИ В ПОЛНЫЙ РАЗМЕР ФАЙЛА
+    // ЗОНА ТЯЖЕЛЫХ ВЫЧИСЛЕНИЙ: ТОЛЬКО ДЛЯ ОДНОКРАТНОЙ ФИЛЬТРАЦИИ ПРИ ОТКРЫТИИ/СМЕНЕ РЕЖИМА
     // ========================================================================
-
-    // Загружаем в видеокарту чистую эталонную геометрию квада для скрытых пассов
-    SimpleVertex masterVerticesQuad[] =
+    if (g_bNeedsUpdate)
     {
-        { { -1.0f,  1.0f, 0.0f },{ 0.0f, 0.0f } },
-        { { 1.0f,  1.0f, 0.0f },{ 1.0f, 0.0f } },
-        { { -1.0f, -1.0f, 0.0f },{ 0.0f, 1.0f } },
-        { { 1.0f, -1.0f, 0.0f },{ 1.0f, 1.0f } },
-    };
-    g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, masterVerticesQuad, 0, 0);
-
-    // Пасс А: Запускаем оригинальный монолитный дефектоскоп 2011 года в буфер Stage3
-    D3D11_VIEWPORT vpS3 = { 0.0f, 0.0f, renderW, renderH, 0.0f, 1.0f };
-    g_pImmediateContext->RSSetViewports(1, &vpS3);
-
-    // Заполняем структуру констант для шейдера
-    ShaderConstants cbDataLocal = {};
-    cbDataLocal.width = (float)g_currentImgWidth;   // Задаем честный шаг кадра (184.0f)
-    cbDataLocal.height = (float)g_currentImgHeight;  // Задаем честный шаг кадра (184.0f)
-    cbDataLocal.d_width = 1.0f / (float)g_currentImgWidth;
-    cbDataLocal.d_height = 1.0f / (float)g_currentImgHeight;
-    cbDataLocal.splitX = 0.5f; // Шторка строго по центру full-size кадра
-    cbDataLocal.padding = 0.5f / (float)g_currentImgWidth;
-    cbDataLocal.macroWidth = (float)g_currentImgWidth / 4.0f;  // Получится 46.0f
-    cbDataLocal.macroHeight = (float)g_currentImgHeight / 4.0f; // Получится 46.0f
-    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
-
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
-    g_pImmediateContext->RSSetViewports(1, &vpS3);
-
-    g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
-    g_pImmediateContext->Draw(4, 0);
-
-    // Чисто разрываем связи Пасса А
-    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
-    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
-
-    if (g_pMacroStaging && g_pMacroTexture4x4)
-    {
-        // Делаем моментальный слепок боевой матрицы для процессора
-        g_pImmediateContext->CopyResource(g_pMacroStaging, g_pMacroTexture4x4);
-    }
-
-    if (g_pTextureStaging && g_pTextureSRV)
-    {
-        // Извлекаем саму текстуру оригинала из её ресурса SRV
-        ID3D11Resource* pSrcRes = NULL;
-        g_pTextureSRV->GetResource(&pSrcRes);
-
-        if (pSrcRes)
+        if (g_pStage3RTV && g_pStageMasterRTV)
         {
-            // Видеокарта аппаратно копирует оригинальный кадр в буфер-шпион!
-            g_pImmediateContext->CopyResource(g_pTextureStaging, pSrcRes);
-            pSrcRes->Release();
+            if (g_hDlgStatusWnd) SendMessage(g_hDlgStatusWnd, SB_SETTEXT, 0, (LPARAM)L"GPU Пасс А: Фильтрация...");
+
+            D3D11_VIEWPORT vpS3 = { 0.0f, 0.0f, renderW, renderH, 0.0f, 1.0f };
+            g_pImmediateContext->RSSetViewports(1, &vpS3);
+
+            ShaderConstants cbDataLocal = {};
+            cbDataLocal.width = renderW;
+            cbDataLocal.height = renderH;
+            cbDataLocal.d_width = 1.0f / renderW;
+            cbDataLocal.d_height = 1.0f / renderH;
+            cbDataLocal.splitX = 0.5f;
+            g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
+
+            g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
+            g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
+            g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
+            g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+            g_pImmediateContext->Draw(4, 0);
+            g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+            if (g_pMacroStaging) {
+                ID3D11Resource* pStage3Res = NULL;
+                g_pStage3RTV->GetResource(&pStage3Res);
+                if (pStage3Res) {
+                    g_pImmediateContext->CopyResource(g_pMacroStaging, pStage3Res);
+                    pStage3Res->Release();
+                }
+            }
+
+            if (g_hDlgStatusWnd) SendMessage(g_hDlgStatusWnd, SB_SETTEXT, 0, (LPARAM)L"GPU Пасс Б: Сборка мастер-кадра...");
+            g_pImmediateContext->ClearRenderTargetView(g_pStageMasterRTV, ClearColorBlack);
+            g_pImmediateContext->OMSetRenderTargets(1, &g_pStageMasterRTV, NULL);
+            g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
+            g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+
+            if (g_bUseCPUProcessing && g_pCpuTextureSRV) {
+                g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV);
+            }
+            else {
+                g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+            }
+            g_pImmediateContext->Draw(4, 0);
+
+            g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+            g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
+            g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
         }
+
+        if (g_hDlgWnd) InvalidateRect(g_hDlgWnd, NULL, FALSE);
+        g_bNeedsUpdate = false; // Тяжелый расчет сбросили
+        if (g_hDlgStatusWnd) SendMessage(g_hDlgStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Фильтрация завершена.");
     }
-
-    // Пасс Б: Сборка финальной шторки "До / После" в Полноразмерный Мастер-Буфер
-    g_pImmediateContext->ClearRenderTargetView(g_pStageMasterRTV, ClearColorBlack);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageMasterRTV, NULL);
-    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // t0: Оригинал кадра
-
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);   // t1: Результат дефектоскопа Пасса А!
-
-    vpWin = { 0.0f, 0.0f, (float)g_currentImgWidth, (float)g_currentImgHeight, 0.0f, 1.0f };
-    g_pImmediateContext->RSSetViewports(1, &vpWin);
-
-    if (g_bUseCPUProcessing && g_pCpuTextureSRV) {
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV); // t1: Красивый CPU-результат
-    }
-    else {
-        g_pImmediateContext->PSSetShaderResources(1, 1, &g_pTextureSRV);
-    }
-    g_pImmediateContext->Draw(4, 0);
-
-    // Полный сброс скрытого этапа вычислений
-    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
-    g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
-    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
 
     // ========================================================================
-    // ЭТАП II: ВЫВОД ГОТОВОГО РЕЗУЛЬТАТА НА ЭКРАН С УЧЕТОМ МАСШТАБА И СКРОЛЛИНГА
+    // ЗОНА ДИНАМИЧЕСКОЙ ГЕОМЕТРИИ (МАСШТАБ, ПОЛЗУНКИ, ШТОРКА): ВЫЗЫВАЕТСЯ ВСЕГДА!
     // ========================================================================
-
-    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
-
-    D3D11_VIEWPORT vpFull = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
-    g_pImmediateContext->RSSetViewports(1, &vpFull);
-
     float xLeft = -1.0f, xRight = 1.0f;
     float yTop = 1.0f, yBottom = -1.0f;
 
     if (g_bFitToWindow)
     {
         float windowAspect = (float)g_wndW / (float)g_wndH;
-        float imageAspect = (float)fileWidth / (float)fileHeight;
-
+        float imageAspect = renderW / renderH;
         if (imageAspect > windowAspect) {
             float scaleY = windowAspect / imageAspect;
             yTop = scaleY; yBottom = -scaleY;
@@ -1015,103 +1008,52 @@ void Render()
     }
     else
     {
-        float targetW = (float)fileWidth / g_zoomDivider;
-        float targetH = (float)fileHeight / g_zoomDivider;
-
+        // Сюда мгновенно транслируются изменения от ползунков g_scrollRatioX/Y и масштаба g_zoomDivider
+        float targetW = renderW / g_zoomDivider;
+        float targetH = renderH / g_zoomDivider;
         float maxScrollX = (targetW > (float)g_wndW) ? (targetW - (float)g_wndW) : 0.0f;
         float maxScrollY = (targetH > (float)g_wndH) ? (targetH - (float)g_wndH) : 0.0f;
-
         float currentOffsetX = g_scrollRatioX * maxScrollX;
         float currentOffsetY = g_scrollRatioY * maxScrollY;
-
         float posX = -currentOffsetX;
         float posY = -currentOffsetY;
-
         xLeft = (posX / (float)g_wndW) * 2.0f - 1.0f;
         xRight = ((posX + targetW) / (float)g_wndW) * 2.0f - 1.0f;
         yTop = 1.0f - (posY / (float)g_wndH) * 2.0f;
         yBottom = 1.0f - ((posY + targetH) / (float)g_wndH) * 2.0f;
     }
 
-    g_currentVertices[0] = { { xLeft,  yTop,    0.0f },{ 0.0f, 0.0f } };
-    g_currentVertices[1] = { { xRight, yTop,    0.0f },{ 1.0f, 0.0f } };
-    g_currentVertices[2] = { { xLeft,  yBottom, 0.0f },{ 0.0f, 1.0f } };
+    // Каждую микросекунду обновляем координаты сетки на видеокарте
+    g_currentVertices[0] = { { xLeft, yTop, 0.0f },{ 0.0f, 0.0f } };
+    g_currentVertices[1] = { { xRight, yTop, 0.0f },{ 1.0f, 0.0f } };
+    g_currentVertices[2] = { { xLeft, yBottom, 0.0f },{ 0.0f, 1.0f } };
     g_currentVertices[3] = { { xRight, yBottom, 0.0f },{ 1.0f, 1.0f } };
-
     g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, g_currentVertices, 0, 0);
 
-    g_pImmediateContext->VSSetShader(g_pVertexShader, NULL, 0);
-    g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
-
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pMacroSRV4x4);
-    g_pImmediateContext->Draw(4, 0);
-    
-    g_pSwapChain->Present(0, 0);
-}
-*/
-
-// === НОВЫЙ БЕЗОПАСНЫЙ КОД: ФУНКЦИЯ ДВУХЭКРАННОГО ВЫВОДА "ДО / ПОСЛЕ" ===
-void Render()
-{
-    // 1. Проверяем базовые системные дескрипторы
-    if (!g_pImmediateContext) {
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет контекста устройства (g_pImmediateContext).");
-        return;
-    }
-    if (!g_pRenderTargetView) {
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет главного буфера экрана (g_pRenderTargetView).");
-        return;
-    }
-    if (!g_pSwapChain) {
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Нет SwapChain.");
-        return;
-    }
-
-    // 2. Очищаем холст
-    float ClearColorBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorBlack);
+    // ========================================================================
+    // ЗОНА МГНОВЕННОГО ВЫВОДА КАДРА НА ЭКРАН (60+ FPS)
+    // ========================================================================
+    float ClearColorGrey[] = { 0.75f, 0.75f, 0.75f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, ClearColorGrey);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
 
-    // 3. Проверяем текстуру оригинала
-    if (!g_pTextureSRV) {
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Текстура оригинала g_pTextureSRV равна NULL!");
-        return;
+    D3D11_VIEWPORT vpFull = { 0.0f, 0.0f, (float)g_wndW, (float)g_wndH, 0.0f, 1.0f };
+    g_pImmediateContext->RSSetViewports(1, &vpFull);
+    g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+    g_pImmediateContext->PSSetSamplers(0, 1, &g_pSamplerState);
+
+    g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
+    if (g_pStageMasterSRV) {
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageMasterSRV);
     }
-
-    // 4. Проверяем финальный шейдер
-    if (!g_pPixelShaderFinal) {
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)L"Ошибка диагностики: Финальный шейдер g_pPixelShaderFinal не загружен!");
-        return;
+    else {
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
     }
-
-    // 5. Настраиваем геометрию и выполняем отрисовку
-    vpWin.Width = g_wndW;
-    vpWin.Height = g_wndH;
-    vpWin.TopLeftX = 0.0f;
-    vpWin.TopLeftY = 0.0f;
-    g_pImmediateContext->RSSetViewports(1, &vpWin);
-
-    g_pImmediateContext->PSSetShader(g_pPixelShaderFinal, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
 
     g_pImmediateContext->Draw(4, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
 
-    // 6. Выводим кадр и проверяем результат команды Present
-    HRESULT hrPresent = g_pSwapChain->Present(0, 0);
-    if (FAILED(hrPresent))
-    {
-        wchar_t errBuf[128];
-        wsprintf(errBuf, L"Аппаратный сбой Present! Код ошибки: 0x%08X", hrPresent);
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)errBuf);
-    }
-    else
-    {
-        // Если видеокарта отработала честно — подтверждаем это в строке статуса
-        wchar_t okBuf[128];
-        wsprintf(okBuf, L"Кадр 4128х3096 отправлен на GPU. Ошибка отрисовки отсутствует. Проверьте шейдер.");
-        SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)okBuf);
-    }
+    g_pSwapChain->Present(0, 0);
 }
 
 
@@ -1278,18 +1220,18 @@ void CreateAppMenu(HWND hwnd)
     // === НОВОЕ: ДОБАВЛЯЕМ УПРАВЛЕНИЕ РЕЖИМАМИ СРАВНЕНИЯ ===
     AppendMenuW(hViewMenu, MF_STRING, IDM_VIEW_CPU, L"Программный режим (CPU)");
     // === ВНЕДРЕНИЕ: КАСКАДНОЕ ПОДМЕНЮ ДИСКРЕТНЫХ МАСШТАБОВ ===
-    HMENU hZoomSubMenu = CreateMenu();
+    g_hZoomSubMenu = CreateMenu();
     // Формируем 6 эталонных вариантов масштабирования
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_FIT, L"Вписать в кадр");
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_1, L"Масштаб 1:1 (Оригинал)");
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_2, L"Масштаб 1:2");
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_4, L"Масштаб 1:4");
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_8, L"Масштаб 1:8");
-    AppendMenuW(hZoomSubMenu, MF_STRING, IDM_ZOOM_16, L"Масштаб 1:16");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_FIT, L"Вписать в кадр");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_1, L"Масштаб 1:1 (Оригинал)");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_2, L"Масштаб 1:2");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_4, L"Масштаб 1:4");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_8, L"Масштаб 1:8");
+    AppendMenuW(g_hZoomSubMenu, MF_STRING, IDM_ZOOM_16, L"Масштаб 1:16");
 
 
     // Встраиваем всплывающее подменю Масштаба внутрь нашего родительского меню "Вид" [INDEX_146]
-    AppendMenuW(hViewMenu, MF_POPUP, (UINT_PTR)hZoomSubMenu, L"Масштаб");
+    AppendMenuW(hViewMenu, MF_POPUP, (UINT_PTR)g_hZoomSubMenu, L"Масштаб");
 
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hViewMenu, L"Вид");
     AppendMenuW(hFileMenu, MF_SEPARATOR, 0, NULL); // Разделительная линия
@@ -1405,8 +1347,11 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
             pTexture->Release();
 
-        g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
-        g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
+            g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
+            g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
+
+            g_bFitToWindow = true; // Подтверждаем режим авто-вписывания в памяти
+            PostMessage(hwnd, WM_COMMAND, IDM_ZOOM_FIT, 0); // Кидаем команду "Вписать в кадр" в очередь
         }
 
         // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
@@ -1647,6 +1592,20 @@ bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
 }
 // === КОНЕЦ НОВОГО КОДА ===
 
+void UpdateZoomMenuCheck(int checkedId)
+{
+    if (!g_hZoomSubMenu) return;
+
+    // Перебираем все наши 6 масштабов и снимаем с них птички
+    int zoomIDs[] = { IDM_ZOOM_FIT, IDM_ZOOM_1, IDM_ZOOM_2, IDM_ZOOM_4, IDM_ZOOM_8, IDM_ZOOM_16 };
+    for (int i = 0; i < 6; i++) {
+        CheckMenuItem(g_hZoomSubMenu, zoomIDs[i], MF_BYCOMMAND | MF_UNCHECKED);
+    }
+
+    // Ставим птичку строго на тот масштаб, который активен
+    CheckMenuItem(g_hZoomSubMenu, checkedId, MF_BYCOMMAND | MF_CHECKED);
+}
+
 // Главная точка входа Windows-приложения
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow)
 {
@@ -1661,7 +1620,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClass(&wc);
 
-    HWND hwnd = CreateWindowW(
+    hwnd = CreateWindowW(
         CLASS_NAME,                  // Строка 1591: Ваша живая переменная класса со строки 1582!
         L"Мой Шейдерный Видеоплеер", // Строка 1592: Заголовок плеера в кавычках напрямую
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, // Ваши родные стили встроенных ползунков
@@ -1709,6 +1668,30 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     ShowWindow(hwnd, nCmdShow);
 
     CreateAppMenu(hwnd); // НОВОЕ: Физически включаем меню на экране сразу после показа окна
+
+    // ========================================================================
+    // СИНХРОНИЗАЦИЯ СТАРТОВЫХ РЕЖИМОВ И ПАМЯТИ
+    // ========================================================================
+    g_bUseCPUProcessing = true;   // Включаем CPU-режим в памяти (Страница 4)
+    g_bFitToWindow = true;         // Включаем авто-вписывание в памяти (Страница 5)
+    g_bNeedsUpdate = true;         // Разрешаем тяжелый расчет в Render() (Страница 3)
+
+    // Выставляем галочки в главном горизонтальном меню
+    HMENU hMainMenu = GetMenu(hwnd);
+    if (hMainMenu)
+    {
+        // Ставим галочку на Программный режим (IDM_VIEW_CPU = 40003, Страница 1)
+        CheckMenuItem(hMainMenu, IDM_VIEW_CPU, MF_BYCOMMAND | MF_CHECKED);
+
+        // Снимаем галочку с режима "Только результат" (IDM_VIEW_RESULT_ONLY = 1006, Страница 1)
+        CheckMenuItem(hMainMenu, IDM_VIEW_RESULT_ONLY, MF_BYCOMMAND | MF_UNCHECKED);
+
+        // Синхронизируем подменю масштабов (g_hZoomSubMenu, Страница 3)
+        if (g_hZoomSubMenu)
+        {
+            CheckMenuItem(g_hZoomSubMenu, IDM_ZOOM_FIT, MF_BYCOMMAND | MF_CHECKED);
+        }
+    }
 
     CreateDiagnosticWindow(hInstance, hwnd);
 
@@ -1965,6 +1948,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             Render();
         }
     }
+    g_bNeedsUpdate = true;
     return 0;
 
     case WM_VSCROLL:
@@ -2001,6 +1985,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
 
     }
+    g_bNeedsUpdate = true;
     return 0;
 
     case WM_SIZE:
@@ -2048,6 +2033,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 pBackBuffer->Release();
             }
         }
+        g_bNeedsUpdate = true;
     }
     break;
 
@@ -2068,6 +2054,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
             // 3. Командуем окну немедленно перерисовать кадр
             InvalidateRect(hwnd, NULL, FALSE);
+
+            g_bNeedsUpdate = true;
             return 0;
 
             // === НАСТОЯЩЕЕ ВНЕДРЕНИЕ: ОБРАБОТКА НАЖАТИЙ НА МАСШТАБЫ ДЕФЕКТОСКОПА ===
@@ -2137,6 +2125,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
             // 4. Перерисовываем экран
             InvalidateRect(hwnd, NULL, FALSE);
+            g_bNeedsUpdate = true;
             return 0;
         }
 
