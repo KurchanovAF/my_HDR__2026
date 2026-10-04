@@ -18,21 +18,20 @@ VS_OUTPUT VS(float4 Pos : POSITION, float2 Tex : TEXCOORD)
 // ========================================================================
 
 // Входные ресурсы DirectX 11
-Texture2D srcTexture : register(t0);        // Наш единственный сырой файл
-Texture2D macroTexture : register(t1);      // Принимаем готовую макротекстуру блоков 46х46!
-SamplerState samplerState0 : register(s0);  // Point-сэмплер без замыливания
-
-// Буфер констант (бывший register(c0))
+Texture2D srcTexture    : register(t0); // t0: Сюда C++ подает оригинал (строка 970)
+Texture2D macroTexture  : register(t1); // t1: Сюда подается маленькая макротекстура 46х46
+Texture2D filterTexture : register(t2); // t2: СЮДА C++ ПОДАЕТ БОЛЬШОЙ КАДР ИЗ СЛОТА 2 (строки 973 и 976)!
+SamplerState samplerState0 : register(s0);
 cbuffer cbData : register(b0)
 {
-    float width;     // p0[0]
-    float height;    // p0[1]
-    float d_width;   // p0[2]
-    float d_height;  // p0[3]
-    float splitX;    // Положение шторки
+    float width;        // р0[0]
+    float height;       // р0[1]
+    float d_width;      // р0[2]
+    float d_height;     // р0[3]
+    float splitX;       // Положение шторки
     float padding;
-    float macroWidth;  // Принимаем 46.0f от процессора
-    float macroHeight; // Принимаем 46.0f от процессора
+    float macroWidth;   // Принимаем 46.0f от процессора
+    float macroHeight;  // Принимаем 46.0f от процессора
 };
 
 static const float3 WEIGHT = float3(0.299f, 0.587f, 0.114f);
@@ -210,34 +209,92 @@ float4 func_LB(float2 tex_in, float4 screen_pos)
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// ГЛАВНЫЙ АППАРАТНЫЙ ШЕЙДЕР ФИЛЬТРАЦИИ
+// ГЛАВНЫЙ АППАРАТНЫЙ ШЕЙДЕР ФИЛЬТРАЦИИ (БЕЗ ФАНТОМОВ И СЕРОГО НАЛЕТА)
+// ГЛАВНЫЙ АППАРАТНЫЙ ШЕЙДЕР ФИЛЬТРАЦИИ (БЕЗ СЕРОГО НАЛЕТА)
 float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 {
-    float2 tex0 = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
- 
-    int block_x = int(input.Pos.x) / 4;
-    int block_y = int(input.Pos.y) / 4;
+    // 1. Получаем абсолютную целочисленную позицию текущего пикселя кадра (например, 1024, 768)
+    int2 pixel_pos = int2(input.Pos.xy);
+    
+    // 2. Вычисляем координаты левого верхнего угла текущего макроблока 4х4
+    int block_x = (pixel_pos.x / 4) * 4;
+    int block_y = (pixel_pos.y / 4) * 4;
+    
+    // 3. Расчет коэффициентов интерполяции Анатолия Федоровича внутри блока
+    int i_x = (pixel_pos.x % 4) * 2;
+    int i_y = (pixel_pos.y % 4) * 2;
 
-    // === МЫ ВСЁ СТЁРЛИ И ВСТАВИЛИ ТОЛЬКО ЭТУ ОДНУ СТРОЧКУ ТЕСТА ===
-    return srcTexture.Sample(samplerState0, input.Tex);
+    // 4. Ограничиваем координаты строго полезной шириной (width) и высотой (height) кадра
+    // Чтобы видеокарта физически не могла залезть в серые мусорные поля дополнения 8х8
+    int4 bounds = int4(0, 0, (int)width - 1, (int)height - 1);
+    
+    int2 coord_S    = clamp(int2(block_x,     block_y),     bounds.xy, bounds.zw);
+    int2 coord_LR   = clamp(int2(block_x + 4, block_y),     bounds.xy, bounds.zw);
+    int2 coord_TB   = clamp(int2(block_x,     block_y + 4), bounds.xy, bounds.zw);
+    int2 coord_LRTB = clamp(int2(block_x + 4, block_y + 4), bounds.xy, bounds.zw);
+
+    // Извлекаем честную монохромную яркость четырех смежных блоков напрямую из t0 через Load
+    float k_S    = dot(srcTexture.Load(int3(coord_S,    0)).rgb, WEIGHT);
+    float k_LR   = dot(srcTexture.Load(int3(coord_LR,   0)).rgb, WEIGHT);
+    float k_TB   = dot(srcTexture.Load(int3(coord_TB,   0)).rgb, WEIGHT);
+    float k_LRTB = dot(srcTexture.Load(int3(coord_LRTB, 0)).rgb, WEIGHT);
+
+    // 5. Двумерная интерполяция яркости
+    float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (9 + i_y) +
+                  (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+                  
+    // 6. Считываем яркость текущего пикселя кадра и считаем локальную разность
+    int2 coord_curr = clamp(pixel_pos, bounds.xy, bounds.zw);
+    float k1 = dot(srcTexture.Load(int3(coord_curr, 0)).rgb, WEIGHT);
+    float delta = k1 - k_SS;
+    
+    // Финальный контрастный результат дефектоскопа
+    float out_gray = saturate(k_SS + delta);
+    return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
 // ШЕЙДЕР СКВОЗНОГО КОПИРОВАНИЯ ЭКРАНА С УЧЕТОМ ШТОРКИ ДО/ПОСЛЕ
-Texture2D filterTexture : register(t1); // Сюда большой Render подает g_pStage3SRV
 
 float4 PS_Final(VS_OUTPUT input) : SV_Target
 {
+    // ========================================================================
+    // ШАГ 6: ОТБРАСЫВАЕМ ДОПОЛНЕННЫЕ СТОЛБЦЫ И СТРОКИ (УСЕЧЕНИЕ МУСОРА)
+    // ========================================================================
+    // width/height — реальные размеры картинки (например, 4125 x 3091)
+    // macroWidth/macroHeight — расширенные размеры, кратные 8 (например, 4128 x 3096)
+    float scaleX = width / macroWidth;
+    float scaleY = height / macroHeight;
+    
+    // Пересчитываем сквозные координаты экрана [0..1] строго в полезную зону текстур
+    float2 cleanUV = float2(input.Tex.x * scaleX, input.Tex.y * scaleY);
+    
+    // Страховочный зажим: гарантирует, что из-за округлений мы не зацепим мусорные пиксели на краях
+    cleanUV = clamp(cleanUV, float2(0.0f, 0.0f), float2(scaleX - 0.0001f, scaleY - 0.0001f));
+
+    // ========================================================================
+    // СБОРКА И СИНХРОНИЗАЦИЯ ШТОРКИ РАЗДЕЛЕНИЯ ЭКРАНА
+    // ========================================================================
+    
+    // 1. ЛЕВАЯ ПОЛОВИНА: Исходный недеформированный оригинал в монохроме
     if (input.Tex.x < splitX)
     {
-        float gray = dot(srcTexture.Sample(samplerState0, input.Tex).rgb, WEIGHT);
+        float4 srcColor = srcTexture.Sample(samplerState0, cleanUV);
+        float gray = dot(srcColor.rgb, WEIGHT);
         return float4(gray, gray, gray, 1.0f);
     }
-    if (abs(input.Tex.x - splitX) < 0.0015f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
     
-    // Возвращаем результат обработки с правого слота t1
-    return filterTexture.Sample(samplerState0, input.Tex);
+    // 2. РАЗДЕЛИТЕЛЬНАЯ ЛИНИЯ: Тонкая черная вертикальная шторка
+    if (abs(input.Tex.x - splitX) < 0.0015f)
+    {
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    
+    // ========================================================================
+    // ТОЧНОЕ ИСПРАВЛЕНИЕ: Читаем строго из filterTexture по единому масштабу!
+    // ========================================================================
+    float4 filteredColor = filterTexture.Sample(samplerState0, cleanUV); 
+    return float4(filteredColor.rgb, 1.0f);
 }
-
 
 // Простой шейдер копирования кадра для ЭТАПА II
 float4 PS_Copy(VS_OUTPUT input) : SV_Target

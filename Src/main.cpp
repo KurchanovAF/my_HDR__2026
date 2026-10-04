@@ -970,15 +970,15 @@ void Render()
             g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
 
             if (g_bUseCPUProcessing && g_pCpuTextureSRV) {
-                g_pImmediateContext->PSSetShaderResources(1, 1, &g_pCpuTextureSRV);
+                g_pImmediateContext->PSSetShaderResources(2, 1, &g_pCpuTextureSRV);
             }
             else {
-                g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage3SRV);
+                g_pImmediateContext->PSSetShaderResources(2, 1, &g_pStage3SRV);
             }
             g_pImmediateContext->Draw(4, 0);
 
             g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
-            g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
+            g_pImmediateContext->PSSetShaderResources(2, 1, nullSRV);
             g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
         }
 
