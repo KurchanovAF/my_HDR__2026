@@ -308,55 +308,48 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
-        // Процессор открывает контекст рисования Windows (GDI)
         HDC hdc = BeginPaint(hWnd, &ps);
 
-        // Создаем кисть в зависимости от выбранного режима
+        // Берем только ту область, которую Windows официально просит обновить (ps.rcPaint)
+        // Это предотвратит повторные циклы рисования поверх уже готового кадра
         HBRUSH hBrush = NULL;
+
         switch (g_diagMode)
         {
-        case 0:
+        case 0: // Режим 1: Исходный
         {
-            // 1. Очищаем фон окна отладки перед выводом
+            // Очищаем фон ОДИН раз
             HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-            RECT rCtx = { 0, 0, 400, 400 };
-            FillRect(hdc, &rCtx, hBg);
+            FillRect(hdc, &ps.rcPaint, hBg); // Очищаем строго область запроса, а не весь 400х400
             DeleteObject(hBg);
 
-            // 2. Проверяем буфер CPU
             if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                // Вычисляем видимый диапазон пикселей (размер окна 400x400, пиксель укрупнен в 2 раза)
-                // Переводим экранный сдвиг ползунков в координаты массива пикселей (делим на 2)
                 UINT startX = g_dlgScrollX / 2;
                 UINT startY = g_dlgScrollY / 2;
-                UINT endX = (g_dlgScrollX + 400) / 2;
-                UINT endY = (g_dlgScrollY + 400) / 2;
+                UINT endX = startX + 200;
+                UINT endY = startY + 200;
 
-                // Ограничиваем диапазоны реальными размерами картинки
                 if (endX > g_currentImgWidth) endX = g_currentImgWidth;
                 if (endY > g_currentImgHeight) endY = g_currentImgHeight;
 
                 for (UINT y = startY; y < endY; y++)
                 {
+                    UINT rowOffset = y * g_currentImgWidth;
                     for (UINT x = startX; x < endX; x++)
                     {
-                        DWORD color = pPixelsBuffer[y * g_currentImgWidth + x];
-
+                        DWORD color = pPixelsBuffer[rowOffset + x];
                         BYTE b = (BYTE)(color & 0xFF);
                         BYTE g = (BYTE)((color >> 8) & 0xFF);
                         BYTE r = (BYTE)((color >> 16) & 0xFF);
 
                         HBRUSH hPxlBrush = CreateSolidBrush(RGB(r, g, b));
-
-                        // При отрисовке вычитаем текущий сдвиг ползунков, чтобы картинка скроллилась!
                         RECT pxlRect = {
-                            (int)x * 2 - g_dlgScrollX,
-                            (int)y * 2 - g_dlgScrollY + 40,
-                            (int)(x + 1) * 2 - g_dlgScrollX,
-                            (int)(y + 1) * 2 - g_dlgScrollY + 40
+                            (int)(x - startX) * 2,
+                            (int)(y - startY) * 2 + 40,
+                            (int)(x - startX + 1) * 2,
+                            (int)(y - startY + 1) * 2 + 40
                         };
-
                         FillRect(hdc, &pxlRect, hPxlBrush);
                         DeleteObject(hPxlBrush);
                     }
@@ -364,61 +357,45 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
         }
         break;
-        case 1:
+        case 1: // Режим 2: Монохромный
         {
-            // 1. По умолчанию очищаем фон в строгий черный цвет
             HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-            RECT rCtx = { 0, 0, 400, 400 };
-            FillRect(hdc, &rCtx, hBg);
+            FillRect(hdc, &ps.rcPaint, hBg);
             DeleteObject(hBg);
 
-            // 2. Если видеокарта подготовила данные — вскрываем буфер-шпион!
-            if (g_pImmediateContext && g_pMacroStaging && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                D3D11_MAPPED_SUBRESOURCE mappedResource = {};
-                HRESULT hrMap = g_pImmediateContext->Map(g_pMacroStaging, 0, D3D11_MAP_READ, 0, &mappedResource);
-                if (SUCCEEDED(hrMap) && mappedResource.pData)
+                UINT startX = g_dlgScrollX / 2;
+                UINT startY = g_dlgScrollY / 2;
+                UINT endX = startX + 200;
+                UINT endY = startY + 200;
+
+                if (endX > g_currentImgWidth) endX = g_currentImgWidth;
+                if (endY > g_currentImgHeight) endY = g_currentImgHeight;
+
+                for (UINT y = startY; y < endY; y++)
                 {
-                    DWORD* pBufferPixels = (DWORD*)mappedResource.pData;
-                    UINT strideDWORD = mappedResource.RowPitch / sizeof(DWORD);
-
-                    // Реальные размеры макротекстуры блоков (в 4 раза меньше сторон кадра)
-                    UINT macroW = g_currentImgWidth / 4;
-                    UINT macroH = g_currentImgHeight / 4;
-
-                    // Вычисляем видимый диапазон блоков (размер окна 400x400, блок укрупнен в 8 раз)
-                    UINT startBlockX = g_dlgScrollX / 8;
-                    UINT startBlockY = g_dlgScrollY / 8;
-                    UINT endBlockX = (g_dlgScrollX + 400) / 8;
-                    UINT endBlockY = (g_dlgScrollY + 400) / 8;
-
-                    if (endBlockX > macroW) endBlockX = macroW;
-                    if (endBlockY > macroH) endBlockY = macroH;
-
-                    for (UINT y = startBlockY; y < endBlockY; y++)
+                    UINT rowOffset = y * g_currentImgWidth;
+                    for (UINT x = startX; x < endX; x++)
                     {
-                        for (UINT x = startBlockX; x < endBlockX; x++)
-                        {
-                            DWORD rawColor = pBufferPixels[y * strideDWORD + x];
+                        DWORD color = pPixelsBuffer[rowOffset + x];
+                        BYTE b = (BYTE)(color & 0xFF);
+                        BYTE g = (BYTE)((color >> 8) & 0xFF);
+                        BYTE r = (BYTE)((color >> 16) & 0xFF);
 
-                            BYTE r = (BYTE)(rawColor & 0xFF);
-                            BYTE g = (BYTE)((rawColor >> 8) & 0xFF);
-                            BYTE b = (BYTE)((rawColor >> 16) & 0xFF);
+                        float grayVal = (float)r * 0.299f + (float)g * 0.587f + (float)b * 0.114f;
+                        BYTE gray = (BYTE)grayVal;
 
-                            HBRUSH hBlockBrush = CreateSolidBrush(RGB(r, g, b));
-
-                            // При отрисовке вычитаем текущий сдвиг ползунков окна отладки
-                            RECT blockRect;
-                            blockRect.left = (int)x * 8 - g_dlgScrollX;
-                            blockRect.right = (int)(x + 1) * 8 - g_dlgScrollX;
-                            blockRect.top = (int)y * 8 - g_dlgScrollY + 40;
-                            blockRect.bottom = (int)(y + 1) * 8 - g_dlgScrollY + 40;
-
-                            FillRect(hdc, &blockRect, hBlockBrush);
-                            DeleteObject(hBlockBrush);
-                        }
+                        HBRUSH hPxlBrush = CreateSolidBrush(RGB(gray, gray, gray));
+                        RECT pxlRect = {
+                            (int)(x - startX) * 2,
+                            (int)(y - startY) * 2 + 40,
+                            (int)(x - startX + 1) * 2,
+                            (int)(y - startY + 1) * 2 + 40
+                        };
+                        FillRect(hdc, &pxlRect, hPxlBrush);
+                        DeleteObject(hPxlBrush);
                     }
-                    g_pImmediateContext->Unmap(g_pMacroStaging, 0);
                 }
             }
         }
@@ -917,33 +894,6 @@ HRESULT InitDevice(HWND hwnd)
         sdDlg.SampleDesc.Count = 1;
         sdDlg.SampleDesc.Quality = 0;
         sdDlg.Windowed = TRUE;
-
-        IDXGIDevice* pDXGIDevice = NULL;
-        g_pd3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDXGIDevice);
-        IDXGIAdapter* pDXGIAdapter = NULL;
-        if (pDXGIDevice) pDXGIDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&pDXGIAdapter);
-        IDXGIFactory* pIDXGIFactory = NULL;
-        if (pDXGIAdapter) pDXGIAdapter->GetParent(__uuidof(IDXGIFactory), (void**)&pIDXGIFactory);
-
-        if (pIDXGIFactory)
-        {
-            hr = pIDXGIFactory->CreateSwapChain(g_pd3dDevice, &sdDlg, &g_pDlgSwapChain);
-        }
-
-        if (pIDXGIFactory) pIDXGIFactory->Release();
-        if (pDXGIAdapter) pDXGIAdapter->Release();
-        if (pDXGIDevice) pDXGIDevice->Release();
-
-        if (SUCCEEDED(hr) && g_pDlgSwapChain)
-        {
-            ID3D11Texture2D* pBackBufferDlg = NULL;
-            hr = g_pDlgSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBufferDlg);
-            if (SUCCEEDED(hr) && pBackBufferDlg)
-            {
-                hr = g_pd3dDevice->CreateRenderTargetView(pBackBufferDlg, NULL, &g_pDlgRenderTargetView);
-                pBackBufferDlg->Release();
-            }
-        }
     }
     return S_OK;
 }
@@ -1365,21 +1315,29 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     UINT paddedWidth = ((imgWidth + 7) / 8) * 8;
     UINT paddedHeight = ((imgHeight + 7) / 8) * 8;
 
-    // Выделяем буфер под расширенный кадр и временный под сырые пиксели
     pPixelsBuffer = new UINT[paddedWidth * paddedHeight];
+
+    // Вычисляем честный stride: для формата 32bpp это ровно imgWidth * 4 байт
+    UINT wicStride = imgWidth * sizeof(UINT);
     pRawPixels = new UINT[imgWidth * imgHeight];
 
-    hr = pConverter->CopyPixels(NULL, imgWidth * sizeof(UINT), imgWidth * imgHeight * sizeof(UINT), (BYTE*)pRawPixels);
-
+    // Копируем пиксели из WIC, используя правильный stride строки
+    hr = pConverter->CopyPixels(NULL, wicStride, wicStride * imgHeight, (BYTE*)pRawPixels);
     if (SUCCEEDED(hr))
     {
         // Заполняем расширенный буфер с дублированием краев
         for (UINT y = 0; y < paddedHeight; y++)
         {
+            // Если вышли за нижний край оригинала — дублируем последнюю строку кадра
             UINT srcY = (y < imgHeight) ? y : (imgHeight - 1);
+
             for (UINT x = 0; x < paddedWidth; x++)
             {
+                // Если вышли за правый край оригинала — дублируем последний пиксель строки
                 UINT srcX = (x < imgWidth) ? x : (imgWidth - 1);
+
+                // ВАЖНО: Читаем из сырого буфера по шагу wicStride (imgWidth),
+                // а пишем в расширенный по шагу paddedWidth!
                 pPixelsBuffer[y * paddedWidth + x] = pRawPixels[srcY * imgWidth + srcX];
             }
         }
