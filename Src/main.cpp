@@ -60,8 +60,10 @@ int                      g_diagMode = 1;                // Текущий реж
 ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
 ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточная текстура для оригинала кадра
 
-UINT* pPixelsBuffer = NULL; // Наш глобальный массив кадра для CPU и отладки!
-UINT* pRawPixels = NULL; // Наш глобальный массив кадра для CPU и отладки!
+UINT* pPixelsBuffer = NULL;                             // Наш глобальный массив кадра для CPU и отладки!
+UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!
+UINT* pCompressedBuffer8x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
+UINT* pStretchedBuffer = NULL;                          // Буфер для хранения кадра, растянутого обратно после сжатия
 // ===================================================================
 bool g_bNeedsUpdate = true;                             // По умолчанию true, чтобы плеер отрисовал самый первый кадр при старте
 HMENU g_hZoomSubMenu = NULL;                            // Глобальный дескриптор для подменю масштабов
@@ -120,6 +122,8 @@ int                     g_scrollX = 0; // Текущий сдвиг картин
 int                     g_scrollY = 0; // Текущий сдвиг картинки по вертикали в пикселях
 int                     g_dlgScrollX = 0; // Сдвиг по горизонтали для окна диагностики
 int                     g_dlgScrollY = 0; // Сдвиг по вертикали для окна диагностики
+int                     g_dlgScrollX_8x8 = 0; // Сдвиг по горизонтали для окна диагностики
+int                     g_dlgScrollY_8x8 = 0; // Сдвиг по вертикали для окна диагностики
 UINT                    g_currentImgWidth = 0;  // Храним размеры текущего файла
 UINT                    g_currentImgHeight = 0;
 
@@ -207,6 +211,62 @@ HRESULT CompileShaderFromFile(const WCHAR* szFileName, LPCSTR szEntryPoint, LPCS
     return S_OK;
 }
 
+// ========================================================================
+// НОВАЯ ФУНКЦИЯ ДИНАМИЧЕСКОЙ НАСТРОЙКИ ПОЛЗУНКОВ ПОД ТЕКУЩИЙ РЕЖИМ
+// ========================================================================
+void UpdateDlgScrollbars(HWND hWnd)
+{
+    if (g_currentImgWidth == 0 || g_currentImgHeight == 0) return;
+
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(SCROLLINFO);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+
+    // Получаем реальные размеры рабочей области отладочного окна прямо сейчас
+    RECT rcClient;
+    GetClientRect(hWnd, &rcClient);
+    int winW = rcClient.right - rcClient.left;
+    int winH = rcClient.bottom - rcClient.top - 40; // Вычитаем 40 пикселей под меню "Режимы"
+
+    if (winW <= 0) winW = 400;
+    if (winH <= 0) winH = 320;
+
+    si.nPage = winW;
+
+    if (g_diagMode == 2) // Если выбран Режим 3: Сжатый в 8 раз
+    {
+        UINT compressedW = g_currentImgWidth / 8;
+        UINT compressedH = g_currentImgHeight / 8;
+
+        si.nPage = winW;
+        si.nMax = compressedW;
+        if (g_dlgScrollX_8x8 > (int)(si.nMax - (int)si.nPage)) g_dlgScrollX_8x8 = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        si.nPos = g_dlgScrollX_8x8;
+        SetScrollInfo(hWnd, SB_HORZ, &si, TRUE);
+
+        si.nPage = winH; // Размер вертикальной страницы равен физической высоте окна winH
+        si.nMax = compressedH;
+        if (g_dlgScrollY_8x8 > (int)(si.nMax - (int)si.nPage)) g_dlgScrollY_8x8 = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        si.nPos = g_dlgScrollY_8x8;
+        SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+    }
+    else // Для Режимов 1 и 2 (Исходный и Монохромный)
+    {
+        // Исходные кадры отображаются с укрупнением в 2 раза
+        si.nMax = g_currentImgWidth;
+        if (g_dlgScrollX > (int)(si.nMax - (int)si.nPage)) g_dlgScrollX = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        si.nPos = g_dlgScrollX;
+        SetScrollInfo(hWnd, SB_HORZ, &si, TRUE);
+
+        si.nPage = winH;
+        si.nMax = g_currentImgHeight;
+        if (g_dlgScrollY > (int)(si.nMax - (int)si.nPage)) g_dlgScrollY = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        si.nPos = g_dlgScrollY;
+        SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+    }
+}
+
 // === 1. ОКОННАЯ ПРОЦЕДУРА ДЛЯ ДИАГНОСТИЧЕСКОЙ ПАНЕЛИ ===
 LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -216,29 +276,46 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
     {
         SCROLLINFO si = {};
         si.cbSize = sizeof(SCROLLINFO);
-        si.fMask = SIF_ALL;
+        si.fMask = SIF_ALL; // Запрашиваем абсолютно все параметры, включая nTrackPos
         GetScrollInfo(hWnd, SB_HORZ, &si);
 
         int oldPos = si.nPos;
-        switch (LOWORD(wParam))
+
+        // В Win32 при отпускании мыши после перетаскивания приходит код SB_THUMBPOSITION,
+        // и реальная позиция лежит строго в si.nTrackPos. Извлекаем её:
+        if (LOWORD(wParam) == SB_THUMBPOSITION || LOWORD(wParam) == SB_THUMBTRACK)
         {
-        case SB_LINELEFT:    si.nPos -= 20; break; // Сдвиг влево на стрелочку
-        case SB_LINERIGHT:   si.nPos += 20; break; // Сдвиг вправо на стрелочку
-        case SB_PAGELEFT:    si.nPos -= si.nPage; break; // Сдвиг кликом по пустому полю
-        case SB_PAGERIGHT:   si.nPos += si.nPage; break;
-        case SB_THUMBTRACK:  si.nPos = si.nTrackPos; break; // Прямое перетаскивание мышью
+            si.nPos = si.nTrackPos;
+        }
+        else
+        {
+            // Обработка кликов по стрелочкам и пустому полю ползунка
+            switch (LOWORD(wParam))
+            {
+            case SB_LINELEFT:  si.nPos -= 10; break; // Удобный шаг сдвига на 10 пикселей
+            case SB_LINERIGHT: si.nPos += 10; break;
+            case SB_PAGELEFT:  si.nPos -= si.nPage; break;
+            case SB_PAGERIGHT: si.nPos += si.nPage; break;
+            }
         }
 
-        // Проверяем рамки диапазона
+        // Жестко удерживаем бегунок в рамках доступного размера кадра
         if (si.nPos < si.nMin) si.nPos = si.nMin;
         if (si.nPos > (int)(si.nMax - (int)si.nPage)) si.nPos = si.nMax - si.nPage;
 
         if (si.nPos != oldPos)
         {
-            g_dlgScrollX = si.nPos; // Сохраняем в нашу глобальную переменную
+            // ИСПРАВЛЕНИЕ: строго записываем чистую позицию без каких-либо искажений масштаба
+            if (g_diagMode == 2) {
+                g_dlgScrollX_8x8 = si.nPos;
+            }
+            else {
+                g_dlgScrollX = si.nPos; // Чистый сдвиг 1:1 для Режимов 1 и 2   
+            }
+
             si.fMask = SIF_POS;
-            SetScrollInfo(hWnd, SB_HORZ, &si, TRUE); // Перерисовываем сам бегунок
-            InvalidateRect(hWnd, NULL, FALSE); // Заставляем окно перерисовать картинку
+            SetScrollInfo(hWnd, SB_HORZ, &si, TRUE); // Обновляем позицию бегунка на рамке
+            InvalidateRect(hWnd, NULL, FALSE);       // Вызываем принудительный WM_PAINT кадра
         }
         return 0;
     }
@@ -258,7 +335,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         case SB_LINEDOWN:  si.nPos += 20; break; // Сдвиг вниз на стрелочку
         case SB_PAGEUP:    si.nPos -= si.nPage; break; // Сдвиг кликом по пустому полю
         case SB_PAGEDOWN:  si.nPos += si.nPage; break;
-        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break; // Прямое перетаскивание мышью
+        case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break; // ИСПРАВЛЕНИЕ: строго отпускание мыши
         }
 
         // Проверяем рамки диапазона
@@ -267,13 +344,29 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
         if (si.nPos != oldPos)
         {
-            g_dlgScrollY = si.nPos; // Сохраняем в нашу глобальную переменную
+            if (g_diagMode == 2) {
+                g_dlgScrollY_8x8 = si.nPos; // Строго для Режима 3 (case 2) пишем в сжатую координату
+            }
+            else {
+                g_dlgScrollY = si.nPos;     // Для Режимов 1 и 2 (case 0 и case 1) пишем в обычную координату
+            }
             si.fMask = SIF_POS;
             SetScrollInfo(hWnd, SB_VERT, &si, TRUE); // Перерисовываем сам бегунок
             InvalidateRect(hWnd, NULL, FALSE); // Заставляем окно перерисовать картинку
         }
         return 0;
     }
+
+    case WM_SIZE:
+        return 0; // Блокируем промежуточную перерисовку во время растягивания
+
+    case WM_EXITSIZEMOVE:
+        // Сначала принудительно обновляем размеры страниц ползунков под новую растянутую рамку окна!
+        UpdateDlgScrollbars(hWnd);
+
+        // Только после этого перерисовываем кадр в масштабе 1:1
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
     case WM_COMMAND:
     {
         int wmId = LOWORD(wParam);
@@ -295,10 +388,12 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 }
             }
             wchar_t titleBuf[128];
-            wsprintf(titleBuf, L"HDR Дефектоскоп — Активен Режим %d", g_diagMode);
+            wsprintf(titleBuf, L"HDR Дефектоскоп — Активен Режим %d", g_diagMode + 1);
             SetWindowText(hWnd, titleBuf);
+            UpdateDlgScrollbars(hWnd); // Перестраиваем диапазоны ползунков под выбранный режим кадра
 
-            g_bNeedsUpdate = true; // Заодно взводим наш флаг, чтобы обновить расчеты кадра!
+            // УДАЛИЛИ ПРИНУДИТЕЛЬНЫЙ ТЯЖЕЛЫЙ ФЛАГ GPU, ЧТОБЫ УБРАТЬ 10-СЕКУНДНОЕ ЗАВИСАНИЕ ОКНА!
+
             InvalidateRect(hWnd, NULL, FALSE);
             return 0;
         }
@@ -325,10 +420,19 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
             if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                UINT startX = g_dlgScrollX / 2;
-                UINT startY = g_dlgScrollY / 2;
-                UINT endX = startX + 200;
-                UINT endY = startY + 200;
+                // Прямо запрашиваем у Windows текущие размеры видимой страницы ползунков
+                SCROLLINFO siH = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
+                GetScrollInfo(hWnd, SB_HORZ, &siH);
+                SCROLLINFO siV = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
+                GetScrollInfo(hWnd, SB_VERT, &siV);
+
+                // В режиме 1:1 индексы считывания равны чистой позиции бегунка
+                UINT startX = siH.nPos;
+                UINT startY = siV.nPos;
+
+                // Граница перебора равна позиции старта плюс физическая ширина видимой страницы окна
+                UINT endX = startX + siH.nPage;
+                UINT endY = startY + siV.nPage;
 
                 if (endX > g_currentImgWidth) endX = g_currentImgWidth;
                 if (endY > g_currentImgHeight) endY = g_currentImgHeight;
@@ -345,10 +449,10 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
                         HBRUSH hPxlBrush = CreateSolidBrush(RGB(r, g, b));
                         RECT pxlRect = {
-                            (int)(x - startX) * 2,
-                            (int)(y - startY) * 2 + 40,
-                            (int)(x - startX + 1) * 2,
-                            (int)(y - startY + 1) * 2 + 40
+                            (int)(x - startX),
+                            (int)(y - startY),
+                            (int)(x - startX + 1),
+                            (int)(y - startY + 1)
                         };
                         FillRect(hdc, &pxlRect, hPxlBrush);
                         DeleteObject(hPxlBrush);
@@ -365,10 +469,19 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
             if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                UINT startX = g_dlgScrollX / 2;
-                UINT startY = g_dlgScrollY / 2;
-                UINT endX = startX + 200;
-                UINT endY = startY + 200;
+                // Прямо запрашиваем у Windows текущие размеры видимой страницы ползунков
+                SCROLLINFO siH = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
+                GetScrollInfo(hWnd, SB_HORZ, &siH);
+                SCROLLINFO siV = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
+                GetScrollInfo(hWnd, SB_VERT, &siV);
+
+                // В режиме 1:1 индексы считывания равны чистой позиции бегунка
+                UINT startX = siH.nPos;
+                UINT startY = siV.nPos;
+
+                // Граница перебора равна позиции старта плюс физическая ширина видимой страницы окна
+                UINT endX = startX + siH.nPage;
+                UINT endY = startY + siV.nPage;
 
                 if (endX > g_currentImgWidth) endX = g_currentImgWidth;
                 if (endY > g_currentImgHeight) endY = g_currentImgHeight;
@@ -388,10 +501,10 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
                         HBRUSH hPxlBrush = CreateSolidBrush(RGB(gray, gray, gray));
                         RECT pxlRect = {
-                            (int)(x - startX) * 2,
-                            (int)(y - startY) * 2 + 40,
-                            (int)(x - startX + 1) * 2,
-                            (int)(y - startY + 1) * 2 + 40
+                            (int)(x - startX),
+                            (int)(y - startY),
+                            (int)(x - startX + 1),
+                            (int)(y - startY + 1)
                         };
                         FillRect(hdc, &pxlRect, hPxlBrush);
                         DeleteObject(hPxlBrush);
@@ -400,14 +513,61 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
         }
         break;
-        case 2: hBrush = CreateSolidBrush(RGB(150, 0, 0));     // Режим 2 - Красный
-            break;
+        case 2: // Режим 3: Сжатый в 8 раз (ВЫВОД БЛОКА ПАМЯТИ ЦЕЛИКОМ ЗА 0 СЕКУНД)
+        {
+            if (pCompressedBuffer8x != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            {
+                UINT compressedW = g_currentImgWidth / 8;
+                UINT compressedH = g_currentImgHeight / 8;
+
+                UINT startX = (UINT)g_dlgScrollX_8x8;
+                UINT startY = (UINT)g_dlgScrollY_8x8;
+
+                RECT rcClient;
+                GetClientRect(hWnd, &rcClient);
+                int winW = rcClient.right - rcClient.left;
+                int winH = rcClient.bottom - rcClient.top;
+
+                if (winW <= 0 || winH <= 0) break;
+
+                // Описываем для Windows структуру нашего блока памяти в ОЗУ (DIB)
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = compressedW;
+                // Отрицательная высота biHeight заставляет Windows читать массив сверху вниз (как у нас в ОЗУ)
+                bmi.bmiHeader.biHeight = -(int)compressedH;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32; // Честные 32 бита (DWORD на пиксель)
+                bmi.bmiHeader.biCompression = BI_RGB;
+
+                // Вычисляем, сколько сжатых пикселей реально помещается в текущее окно
+                int viewW = ((startX + winW) > compressedW) ? (compressedW - startX) : winW;
+                int viewH = ((startY + winH) > compressedH) ? (compressedH - startY) : winH;
+
+                // Сначала очищаем экран от старых хвостов
+                HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                FillRect(hdc, &rcClient, hBg);
+                DeleteObject(hBg);
+
+                // Передаем весь блок данных из ОЗУ одной сверхбыстрой командой без циклов рисования!
+                StretchDIBits(
+                    hdc,
+                    0, 0, viewW, viewH,                 // Куда выводим на экране (левый верхний угол окна)
+                    startX, startY, viewW, viewH,       // Какую область вырезаем из нашего сжатого массива в ОЗУ
+                    pCompressedBuffer8x,                // Указатель на сам готовый блок памяти
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    SRCCOPY
+                );
+            }
+        }
+        break;
         case 3: hBrush = CreateSolidBrush(RGB(0, 120, 30));    // Режим 3 - Зеленый
             break;
         case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
             break;
         }
-
+        /*
         if (hBrush)
         {
             // Описываем полезную квадратную область 400х400 под меню
@@ -416,6 +576,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             FillRect(hdc, &rect, hBrush);
             DeleteObject(hBrush);
         }
+        */
 
         // Процессор закрывает рисование
         EndPaint(hWnd, &ps);
@@ -898,6 +1059,13 @@ HRESULT InitDevice(HWND hwnd)
     return S_OK;
 }
 
+// ЛЁГКАЯ БЕЗОПАСНАЯ ЗАГЛУШКА, КОТОРАЯ ВЫПОЛНЯЕТСЯ ЗА 0 МИЛЛИСЕКУНД И НЕ ТРОГАЕТ GPU
+void Render()
+{
+    // Просто выходим, ничего не вычисляя на видеокарте во время отладки CPU-режимов
+    return;
+}
+
 // Обновленная функция отрисовки (Двухпроходный конвейер рендеринга)
 // Обновленная функция отрисовки (Трехпроходный вычислительный конвейер)
 // Обновленная функция отрисовки (Четырехпроходный вычислительный конвейер)
@@ -907,6 +1075,7 @@ HRESULT InitDevice(HWND hwnd)
 // ПОЛНОЦЕННАЯ СИНХРОНИЗИРОВАННАЯ ФУНКЦИЯ ОТРИСОВКИ С АВТОМАТИЧЕСКИМ СКРОЛЛИНГОМ И СОХРАНЕНИЕМ ПРОПОРЦИЙ
 // УТРЕННЯЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТРИСОВКИ С УМНЫМ ПОРТОМ ПРОСМОТРА
 // ТОЧНАЯ КОПИЯ УТРЕННЕЙ РАБОЧЕЙ ФУНКЦИИ ОТРИСОВКИ (МЯГКИЕ ПОЛУТОНА И СЕРОЕ ПОЛЕ)
+/*
 void Render()
 {
     if (g_pRenderTargetView == NULL || g_pTextureSRV == NULL) return;
@@ -1066,7 +1235,7 @@ void Render()
 
     g_pSwapChain->Present(0, 0);
 }
-
+*/
 
 void RenderSplit()
 {
@@ -1215,6 +1384,14 @@ void CleanupDevice()
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = NULL; }
     if (g_pImmediateContext) { g_pImmediateContext->Release(); g_pImmediateContext = NULL; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = NULL; }
+    if (pCompressedBuffer8x != NULL) {
+        delete[] pCompressedBuffer8x;
+        pCompressedBuffer8x = NULL;
+    }
+    if (pStretchedBuffer != NULL) {
+        delete[] pStretchedBuffer;
+        pStretchedBuffer = NULL;
+    }
 }
 
 // === НОВЫЙ КОД: ФУНКЦИЯ СОЗДАНИЯ СИСТЕМНОГО МЕНЮ ===
@@ -1341,7 +1518,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 pPixelsBuffer[y * paddedWidth + x] = pRawPixels[srcY * imgWidth + srcX];
             }
         }
-
+                
         // 6. Если старая основная текстура уже была в памяти — чисто освобождаем её
         if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
 
@@ -1380,25 +1557,62 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             g_bFitToWindow = true; // Подтверждаем режим авто-вписывания в памяти
             PostMessage(hwnd, WM_COMMAND, IDM_ZOOM_FIT, 0); // Кидаем команду "Вписать в кадр" в очередь
         }
+        // НАЧАЛО ВСТАВКИ: Гарантированный расчет сжатия, когда все глобальные переменные уже заполнены
+        if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+        {
+            if (pCompressedBuffer8x != NULL)
+            {
+                delete[] pCompressedBuffer8x;
+                pCompressedBuffer8x = NULL;
+            }
+
+            UINT compressedW = g_currentImgWidth / 8;
+            UINT compressedH = g_currentImgHeight / 8;
+
+            if (compressedW > 0 && compressedH > 0)
+            {
+                pCompressedBuffer8x = new UINT[compressedW * compressedH];
+
+                for (UINT py = 0; py < compressedH; py++)
+                {
+                    for (UINT px = 0; px < compressedW; px++)
+                    {
+                        UINT sumR = 0, sumG = 0, sumB = 0;
+
+                        // Пробегаем по внутреннему блоку 8х8 исходных пикселей
+                        for (UINT by = 0; by < 8; by++)
+                        {
+                            for (UINT bx = 0; bx < 8; bx++)
+                            {
+                                UINT srcX = px * 8 + bx;
+                                UINT srcY = py * 8 + by;
+
+                                // Читаем из уже готового и проверенного глобального массива
+                                DWORD color = pPixelsBuffer[srcY * g_currentImgWidth + srcX];
+
+                                sumB += (color & 0xFF);
+                                sumG += ((color >> 8) & 0xFF);
+                                sumR += ((color >> 16) & 0xFF);
+                            }
+                        }
+
+                        BYTE avgB = (BYTE)(sumB / 64);
+                        BYTE avgG = (BYTE)(sumG / 64);
+                        BYTE avgR = (BYTE)(sumR / 64);
+
+                        // Монохром по формуле дефектоскопа
+                        float grayVal = (float)avgR * 0.299f + (float)avgG * 0.587f + (float)avgB * 0.114f;
+                        BYTE gray = (BYTE)grayVal;
+
+                        pCompressedBuffer8x[py * compressedW + px] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
+                    }
+                }
+            }
+        }
+        // КОНЕЦ ВСТАВКИ
         if (SUCCEEDED(hr) && g_hDlgWnd != NULL)
         {
-            SCROLLINFO si = {};
-            si.cbSize = sizeof(SCROLLINFO);
-            si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-            si.nMin = 0;
-            si.nPos = 0;
-
-            // Учитываем, что в Режиме 0 пиксели укрупняются в 2 раза
-            // Страница (nPage) равна физическому размеру рабочей зоны окна отладки
-            si.nPage = 400;
-
-            // Горизонтальный ползунок
-            si.nMax = g_currentImgWidth * 2;
-            SetScrollInfo(g_hDlgWnd, SB_HORZ, &si, TRUE);
-
-            // Вертикальный ползунок (учитываем смещение вниз на 40 пикселей под меню)
-            si.nMax = g_currentImgHeight * 2 + 40;
-            SetScrollInfo(g_hDlgWnd, SB_VERT, &si, TRUE);
+            UpdateDlgScrollbars(g_hDlgWnd); // Сразу настраиваем ползунки под текущий режим
         }
 
         // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
@@ -1974,7 +2188,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         case SB_LINERIGHT:  si.nPos += 20; break;  // Кликнули на правую стрелочку
         case SB_PAGELEFT:   si.nPos -= si.nPage; break;
         case SB_PAGERIGHT:  si.nPos += si.nPage; break;
-        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break; // Тащат ползунок мышкой
+        case SB_THUMBPOSITION:  si.nPos = si.nTrackPos; break; // Реагируем только на отпускание мыши
         }
 
         // Зажимаем позицию в физические рамки картинки
@@ -2011,7 +2225,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         case SB_LINEDOWN:  si.nPos += 20; break;  // Кликнули на нижнюю стрелочку
         case SB_PAGEUP:    si.nPos -= si.nPage; break;
         case SB_PAGEDOWN:  si.nPos += si.nPage; break;
-        case SB_THUMBTRACK: si.nPos = si.nTrackPos; break; // Тащат ползунок мышкой
+        case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break; // Реагируем только на отпускание мыши
         }
 
         if (si.nPos < 0) si.nPos = 0;
@@ -2221,7 +2435,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     // Отправляем этот текст в нижний статус-бар!
                     SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)statusBuf);
                     //RenderSplit(); // Переключили плеер в режим сравнения "До / После"
-                    MessageBoxW(hwnd, L"Удалось декодировать файл изображения через WIC.", L"НЕТ ОШИБОК", MB_OK | MB_ICONERROR);
+                    //MessageBoxW(hwnd, L"Удалось декодировать файл изображения через WIC.", L"НЕТ ОШИБОК", MB_OK | MB_ICONERROR);
                 }
                 else
                 {
