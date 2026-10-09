@@ -49,18 +49,36 @@ struct ShaderConstants
 // === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 HWND hwnd;
 
+// Размеры оригинального кадра
+UINT g_srcImgWidth = 0;
+UINT g_srcImgHeight = 0;
+
+// Размеры кадра, дополненного до кратности 8
+UINT g_paddedImgWidth = 0;
+UINT g_paddedImgHeight = 0;
+
+// Размеры сжатого кадра (Режим 3)
+UINT g_compressedWidth = 0;
+UINT g_compressedHeight = 0;
+
+// 4 главных буфера данных (каждый пиксель - 32-битный DWORD: 0x00RRGGBB)
+DWORD* g_pBuffer1_Src = nullptr;          // Исходный кадр
+DWORD* g_pBuffer2_Padded = nullptr;       // Дополненный до кратности 8
+DWORD* g_pBuffer3_Monochrome = nullptr;   // Монохромный высокого разрешения
+DWORD* g_pBuffer4_Compressed8x = nullptr; // Сжатый в 8 раз (Дефектоскоп)
+
 // === ГЛOБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ НЕЗАВИСИМОГО ДИАГНОСТИЧЕСКОГО ОКНА ===
 HWND                     g_hDlgWnd = NULL;              // Дескриптор диагностического окна Windows
 HWND                     g_hStatusWnd = NULL;           // Дескриптор строки статуса внизу плеера
 HWND                     g_hDlgStatusWnd = NULL;        // Строка статуса диагностического окна панели
-IDXGISwapChain* g_pDlgSwapChain = NULL;                 // Цепочка буферов для второго экрана
-ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;  // Цель отрисовки диагностического окна
+IDXGISwapChain*          g_pDlgSwapChain = NULL;        // Цепочка буферов для второго экрана
+ID3D11RenderTargetView*  g_pDlgRenderTargetView = NULL; // Цель отрисовки диагностического окна
 void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
 int                      g_diagMode = 1;                // Текущий режим панели: 1, 2, 3 или 4
 ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
 ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточная текстура для оригинала кадра
 
-UINT* pPixelsBuffer = NULL;                             // Наш глобальный массив кадра для CPU и отладки!
+UINT* pPixelsBuffer = NULL;                             // Наш глобальный исходный массив кадра
 UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!
 UINT* pCompressedBuffer8x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
 UINT* pStretchedBuffer = NULL;                          // Буфер для хранения кадра, растянутого обратно после сжатия
@@ -227,7 +245,7 @@ void UpdateDlgScrollbars(HWND hWnd)
     RECT rcClient;
     GetClientRect(hWnd, &rcClient);
     int winW = rcClient.right - rcClient.left;
-    int winH = rcClient.bottom - rcClient.top - 40; // Вычитаем 40 пикселей под меню "Режимы"
+    int winH = rcClient.bottom - rcClient.top; // Вычитаем 40 пикселей под меню "Режимы"
 
     if (winW <= 0) winW = 400;
     if (winH <= 0) winH = 320;
@@ -241,13 +259,13 @@ void UpdateDlgScrollbars(HWND hWnd)
 
         si.nPage = winW;
         si.nMax = compressedW;
-        if (g_dlgScrollX_8x8 > (int)(si.nMax - (int)si.nPage)) g_dlgScrollX_8x8 = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        if (g_dlgScrollX_8x8 > (si.nMax - (int)si.nPage)) g_dlgScrollX_8x8 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
         si.nPos = g_dlgScrollX_8x8;
         SetScrollInfo(hWnd, SB_HORZ, &si, TRUE);
 
         si.nPage = winH; // Размер вертикальной страницы равен физической высоте окна winH
         si.nMax = compressedH;
-        if (g_dlgScrollY_8x8 > (int)(si.nMax - (int)si.nPage)) g_dlgScrollY_8x8 = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        if (g_dlgScrollY_8x8 > (si.nMax - (int)si.nPage)) g_dlgScrollY_8x8 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
         si.nPos = g_dlgScrollY_8x8;
         SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
     }
@@ -255,16 +273,36 @@ void UpdateDlgScrollbars(HWND hWnd)
     {
         // Исходные кадры отображаются с укрупнением в 2 раза
         si.nMax = g_currentImgWidth;
-        if (g_dlgScrollX > (int)(si.nMax - (int)si.nPage)) g_dlgScrollX = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        if (g_dlgScrollX > (si.nMax - (int)si.nPage)) g_dlgScrollX = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
         si.nPos = g_dlgScrollX;
         SetScrollInfo(hWnd, SB_HORZ, &si, TRUE);
 
         si.nPage = winH;
         si.nMax = g_currentImgHeight;
-        if (g_dlgScrollY > (int)(si.nMax - (int)si.nPage)) g_dlgScrollY = (si.nMax > si.nPage) ? (si.nMax - si.nPage) : 0;
+        if (g_dlgScrollY > (si.nMax - (int)si.nPage)) g_dlgScrollY = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
         si.nPos = g_dlgScrollY;
         SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
     }
+}
+
+void UpdateDiagnosticStatusText(HWND hWnd)
+{
+    if (!g_hDlgStatusWnd) return;
+
+    wchar_t statusBuf[256];
+    if (g_diagMode == 2) // Режим 3: Сжатый в 8 раз
+    {
+        wsprintf(statusBuf, L"Сжатый режим 8х8 | Позиция X: %d, Y: %d",
+            g_dlgScrollX_8x8, g_dlgScrollY_8x8);
+    }
+    else // Режимы 1 и 2: Исходный и Монохромный
+    {
+        wsprintf(statusBuf, L"Режим 1:1 | Позиция X: %d, Y: %d",
+            g_dlgScrollX, g_dlgScrollY);
+    }
+
+    // Отправляем текст в первую секцию строки статуса диагностического окна
+    SendMessage(g_hDlgStatusWnd, SB_SETTEXT, 0, (LPARAM)statusBuf);
 }
 
 // === 1. ОКОННАЯ ПРОЦЕДУРА ДЛЯ ДИАГНОСТИЧЕСКОЙ ПАНЕЛИ ===
@@ -301,7 +339,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
         // Жестко удерживаем бегунок в рамках доступного размера кадра
         if (si.nPos < si.nMin) si.nPos = si.nMin;
-        if (si.nPos > (int)(si.nMax - (int)si.nPage)) si.nPos = si.nMax - si.nPage;
+        if (si.nPos > (si.nMax - (int)si.nPage)) si.nPos = si.nMax - (int)si.nPage;
 
         if (si.nPos != oldPos)
         {
@@ -315,6 +353,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
             si.fMask = SIF_POS;
             SetScrollInfo(hWnd, SB_HORZ, &si, TRUE); // Обновляем позицию бегунка на рамке
+            // НОВЫЙ КОД: Обновляем координаты в строке статуса
+            UpdateDiagnosticStatusText(hWnd);
             InvalidateRect(hWnd, NULL, FALSE);       // Вызываем принудительный WM_PAINT кадра
         }
         return 0;
@@ -329,18 +369,26 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         GetScrollInfo(hWnd, SB_VERT, &si);
 
         int oldPos = si.nPos;
-        switch (LOWORD(wParam))
+
+        if (LOWORD(wParam) == SB_THUMBPOSITION || LOWORD(wParam) == SB_THUMBTRACK)
         {
-        case SB_LINEUP:    si.nPos -= 20; break; // Сдвиг вверх на стрелочку
-        case SB_LINEDOWN:  si.nPos += 20; break; // Сдвиг вниз на стрелочку
-        case SB_PAGEUP:    si.nPos -= si.nPage; break; // Сдвиг кликом по пустому полю
-        case SB_PAGEDOWN:  si.nPos += si.nPage; break;
-        case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break; // ИСПРАВЛЕНИЕ: строго отпускание мыши
+            si.nPos = si.nTrackPos;
+        }
+        else
+        {
+            // Обработка кликов по стрелочкам и пустому полю ползунка
+            switch (LOWORD(wParam))
+            {
+            case SB_LINEUP:  si.nPos -= 10; break; // Удобный шаг сдвига на 10 пикселей
+            case SB_LINEDOWN: si.nPos += 10; break;
+            case SB_PAGEUP:  si.nPos -= si.nPage; break;
+            case SB_PAGEDOWN: si.nPos += si.nPage; break;
+            }
         }
 
         // Проверяем рамки диапазона
         if (si.nPos < si.nMin) si.nPos = si.nMin;
-        if (si.nPos > (int)(si.nMax - (int)si.nPage)) si.nPos = si.nMax - si.nPage;
+        if (si.nPos > (si.nMax - (int)si.nPage)) si.nPos = (si.nMax - (int)si.nPage);
 
         if (si.nPos != oldPos)
         {
@@ -352,6 +400,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
             si.fMask = SIF_POS;
             SetScrollInfo(hWnd, SB_VERT, &si, TRUE); // Перерисовываем сам бегунок
+            // НОВЫЙ КОД: Обновляем координаты в строке статуса
+            UpdateDiagnosticStatusText(hWnd);
             InvalidateRect(hWnd, NULL, FALSE); // Заставляем окно перерисовать картинку
         }
         return 0;
@@ -540,21 +590,24 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 bmi.bmiHeader.biBitCount = 32; // Честные 32 бита (DWORD на пиксель)
                 bmi.bmiHeader.biCompression = BI_RGB;
 
-                // Вычисляем, сколько сжатых пикселей реально помещается в текущее окно
-                int viewW = ((startX + winW) > compressedW) ? (compressedW - startX) : winW;
-                int viewH = ((startY + winH) > compressedH) ? (compressedH - startY) : winH;
+                // ИСПРАВЛЕНИЕ: Вычисляем реальный физический остаток пикселей в буфере памяти ОЗУ,
+                // который мы можем безопасно прочитать без переполнения WinAPI!
+                int viewW = ((startX + winW) > compressedW) ? (int)(compressedW - startX) : winW;
+                int viewH = ((startY + winH) > compressedH) ? (int)(compressedH - startY) : winH;
 
-                // Сначала очищаем экран от старых хвостов
+                // Очищаем фон окна от старых остатков
                 HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
                 FillRect(hdc, &rcClient, hBg);
                 DeleteObject(hBg);
 
-                // Передаем весь блок данных из ОЗУ одной сверхбыстрой командой без циклов рисования!
+                // Передаем блок данных. Высота источника и назначения теперь синхронизированы 
+                // с доступным остатком памяти кадра viewH!
                 StretchDIBits(
                     hdc,
-                    0, 0, viewW, viewH,                 // Куда выводим на экране (левый верхний угол окна)
-                    startX, startY, viewW, viewH,       // Какую область вырезаем из нашего сжатого массива в ОЗУ
-                    pCompressedBuffer8x,                // Указатель на сам готовый блок памяти
+                    0, 0, viewW, viewH,           // Куда выводим на экране панели (левый верхний угол)
+                    (int)startX, (int)startY,     // Откуда начинаем считывание из массива в ОЗУ
+                    viewW, viewH,                 // Сколько пикселей считываем по осям X и Y
+                    pCompressedBuffer8x,          // Указатель на массив пикселей кадра
                     &bmi,
                     DIB_RGB_COLORS,
                     SRCCOPY
@@ -1444,9 +1497,156 @@ void CreateAppMenu(HWND hwnd)
 }
 // === КОНЕЦ НОВОГО КОДА ===
 
+void ProcessAndAllocateBuffers(DWORD* pInitialPixels, UINT width, UINT height)
+{
+    // 0. Освобождаем старую память, если она была выделена
+    delete[] g_pBuffer1_Src;
+    delete[] g_pBuffer2_Padded;
+    delete[] g_pBuffer3_Monochrome;
+    delete[] g_pBuffer4_Compressed8x;
+
+    g_srcImgWidth = width;
+    g_srcImgHeight = height;
+
+    // 1. Заполняем БУФЕР 1: Оригинал
+    UINT srcSize = g_srcImgWidth * g_srcImgHeight;
+    g_pBuffer1_Src = new DWORD[srcSize];
+    memcpy(g_pBuffer1_Src, pInitialPixels, srcSize * sizeof(DWORD));
+
+    // Вычисляем размеры с округлением вверх до кратности 8
+    g_paddedImgWidth = ((g_srcImgWidth + 7) / 8) * 8;
+    g_paddedImgHeight = ((g_srcImgHeight + 7) / 8) * 8;
+    UINT paddedSize = g_paddedImgWidth * g_paddedImgHeight;
+
+    // 2. Создаем БУФЕР 2: Дополненный до кратности 8 (заливаем черным)
+    g_pBuffer2_Padded = new DWORD[paddedSize];
+    memset(g_pBuffer2_Padded, 0, paddedSize * sizeof(DWORD));
+
+    // Копируем оригинал внутрь дополненного буфера
+    for (UINT y = 0; y < g_srcImgHeight; y++)
+    {
+        memcpy(&g_pBuffer2_Padded[y * g_paddedImgWidth],
+            &g_pBuffer1_Src[y * g_srcImgWidth],
+            g_srcImgWidth * sizeof(DWORD));
+    }
+
+    // 3. Создаем БУФЕР 3: Монохромный (на основе дополненного кадра)
+    g_pBuffer3_Monochrome = new DWORD[paddedSize];
+    for (UINT i = 0; i < paddedSize; i++)
+    {
+        DWORD color = g_pBuffer2_Padded[i];
+        BYTE b = (BYTE)(color & 0xFF);
+        BYTE g = (BYTE)((color >> 8) & 0xFF);
+        BYTE r = (BYTE)((color >> 16) & 0xFF);
+
+        // Ваша точная формула перевода в серое вещество
+        BYTE gray = (BYTE)(r * 0.299f + g * 0.587f + b * 0.114f);
+
+        // Сохраняем как честный 32-битный серый пиксель (0x00RRGGBB)
+        g_pBuffer3_Monochrome[i] = RGB(gray, gray, gray);
+    }
+
+    // Размеры сжатого кадра
+    g_compressedWidth = g_paddedImgWidth / 8;
+    g_compressedHeight = g_paddedImgHeight / 8;
+    UINT compressedSize = g_compressedWidth * g_compressedHeight;
+
+    // 4. Создаем БУФЕР 4: Сжатый в 8 раз (Режим 3)
+    g_pBuffer4_Compressed8x = new DWORD[compressedSize];
+
+    // Алгоритм сжатия блоков 8х8 (записывает среднее или дефектное значение блока)
+    for (UINT py = 0; py < g_compressedHeight; py++)
+    {
+        for (UINT px = 0; px < g_compressedWidth; px++)
+        {
+            // Здесь ваша логика обработки блока 8х8 пикселей из g_pBuffer3_Monochrome.
+            // Для примера возьмем просто левый верхний пиксель каждого макроблока:
+            UINT srcX = px * 8;
+            UINT srcY = py * 8;
+            DWORD blockColor = g_pBuffer3_Monochrome[srcY * g_paddedImgWidth + srcX];
+
+            g_pBuffer4_Compressed8x[py * g_compressedWidth + px] = blockColor;
+        }
+    }
+}
+
 #include <wincodec.h> // Подключаем заголовки системного декодера WIC
 
 // === БЕЗОПАСНАЯ ЗАГРУЗКА ЛЮБЫХ КАРТИНОК ЧЕРЕЗ WIC НА ВИДЕОКАРТУ ===
+HRESULT LoadTextureFromFile(const WCHAR* szFileName)
+{
+    HRESULT hr = S_OK;
+
+    // 1. Создаем фабрику декодеров WIC
+    IWICImagingFactory* pWICFactory = NULL;
+    hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (LPVOID*)&pWICFactory);
+    if (FAILED(hr)) return hr;
+
+    // 2. Открываем файл картинки на диске
+    IWICBitmapDecoder* pDecoder = NULL;
+    hr = pWICFactory->CreateDecoderFromFilename(szFileName, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &pDecoder);
+    if (FAILED(hr)) { pWICFactory->Release(); return hr; }
+
+    // 3. Берем самый первый кадр из файла
+    IWICBitmapFrameDecode* pFrame = NULL;
+    hr = pDecoder->GetFrame(0, &pFrame);
+    if (FAILED(hr)) { pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    // 4. Принудительно конвертируем пиксели в формат RGBA 32-бит
+    IWICFormatConverter* pConverter = NULL;
+    hr = pWICFactory->CreateFormatConverter(&pConverter);
+    if (FAILED(hr)) { pFrame->Release(); pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    hr = pConverter->Initialize(pFrame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0f, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) { pConverter->Release(); pFrame->Release(); pDecoder->Release(); pWICFactory->Release(); return hr; }
+
+    // 5. Узнаем физические размеры загруженной картинки
+    UINT imgWidth = 0, imgHeight = 0;
+    pConverter->GetSize(&imgWidth, &imgHeight);
+
+    if (pPixelsBuffer != NULL)  // Если память под кадр уже выделена
+    {
+        delete[] pPixelsBuffer; // Физически возвращаем операционной системе старый блок
+        pPixelsBuffer = NULL;   // Сразу зануляем ярлык, чтобы никто не полез в пустую память
+    }
+    if (pCompressedBuffer8x != NULL)     // Если память под кадр 8x уже выделена
+    {
+        delete[] pCompressedBuffer8x;    // Физически возвращаем операционной системе старый блок
+        pCompressedBuffer8x = NULL;      // Сразу зануляем ярлык, чтобы никто не полез в пустую память
+    }
+    if (pRawPixels != NULL)     // Если память под кадр 8x уже выделена
+    {
+        delete[] pRawPixels;    // Физически возвращаем операционной системе старый блок
+        pRawPixels = NULL;      // Сразу зануляем ярлык, чтобы никто не полез в пустую память
+    }
+    g_srcImgWidth = imgWidth;
+    g_srcImgHeight = imgHeight;
+
+    g_pBuffer1_Src = new DWORD[g_srcImgWidth * g_srcImgHeight];
+
+    // Вычисляем новые размеры, кратные 8
+    g_compressedWidth = ((imgWidth + 7) / 8);    
+    g_compressedHeight = ((imgHeight + 7) / 8);
+
+    pCompressedBuffer8x = new DWORD[g_compressedWidth * g_compressedHeight];
+
+    g_paddedImgWidth = g_compressedWidth * 8;
+    g_paddedImgHeight = g_compressedHeight * 8;
+
+    pPixelsBuffer = new UINT[g_paddedImgWidth * g_paddedImgHeight];
+
+    UINT wicStride = imgWidth * sizeof(UINT);
+    hr = pConverter->CopyPixels(NULL, wicStride, wicStride * imgHeight, (BYTE*)g_pBuffer1_Src);
+
+    // === ЗОЛОТОЕ ПРАВИЛО: ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ БЕЗ УТЕЧЕК! ===
+    pConverter->Release();
+    pFrame->Release();
+    pDecoder->Release();
+    pWICFactory->Release();
+
+    return hr;
+}
+/*
 HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 {
     HRESULT hr = S_OK;
@@ -1809,6 +2009,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
     return hr;
 }
+*/
 
 // === НОВЫЙ КОД: ФУНКЦИЯ ВЫЗОВА СИСТЕМНОГО ПРОВОДНИКА WINDOWS ===
 bool OpenFileDialog(HWND hwnd, bool bOpenVideo)
@@ -2430,7 +2631,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     wchar_t statusBuf[256];
 
                     // Подставляем ваши глобальные переменные ширины и высоты кадра плеера
-                    wsprintf(statusBuf, L"Файл успешно загружен. Габариты кадра: %d x %d пикселей.", g_currentImgWidth, g_currentImgHeight);
+                    wsprintf(statusBuf, L"Габариты кадра: %d x %d пикселей -> %d x %d -> %d x %d", 
+                        g_srcImgWidth, g_srcImgHeight, 
+                        g_compressedWidth, g_compressedHeight, 
+                        g_paddedImgWidth, g_paddedImgHeight);
 
                     // Отправляем этот текст в нижний статус-бар!
                     SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)statusBuf);
