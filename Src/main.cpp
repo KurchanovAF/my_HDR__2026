@@ -3,6 +3,9 @@
 #include <d3dcompiler.h>
 #include <cmath> // ИСПРАВЛЕНИЕ: Подключили математические функции sqrt и pow для CPU
 
+#include <commctrl.h>
+#pragma comment(lib, "comctl32.lib")
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -42,6 +45,9 @@ struct ShaderConstants
     float splitX;   // Положение шторки (доля от 0.0 до 1.0)
     float padding[3]; // Выравнивание структуры в памяти под требования DirectX (кратность 16 байт)
 };
+
+//
+void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
 
 // Прототип функции программной фильтрации на центральном процессоре
 HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixels);
@@ -83,6 +89,27 @@ ID3D11ShaderResourceView* g_pStageDown8SRV = NULL;
 // Стадия 1:16
 ID3D11RenderTargetView* g_pStageDown16RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown16SRV = NULL;
+
+// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+HWND                    hwnd;
+HWND                    g_hStatusWnd = NULL;           // Дескриптор строки статуса внизу плеера
+
+// Размеры оригинального кадра
+UINT g_srcImgWidth = 0;
+UINT g_srcImgHeight = 0;
+
+// Размеры кадра, дополненного до кратности 8
+UINT g_paddedImgWidth = 0;
+UINT g_paddedImgHeight = 0;
+
+// Размеры сжатого кадра (Режим 3)
+UINT g_compressedWidth = 0;
+UINT g_compressedHeight = 0;
+
+#define my_DRBUG
+#ifdef my_DEBUG
+#include my_debug.c
+#endif
 
 // === НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПРОГРАММНОГО РЕЖИМА (CPU) ===
 bool                      g_bUseCPUProcessing = false; // true - процессор, false - видеокарта
@@ -567,6 +594,9 @@ void Render()
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
+
+    // ЖЕСТКАЯ ОЧИСТКА ШЕЙДЕРА МЕЖДУ ПАССАМИ (Убирает фантомное двоение масштабов)
+    g_pImmediateContext->PSSetShader(NULL, NULL, 0);
 
     // ========================================================================
     // ЭТАП II: ВЫВОД ГОТОВОГО РЕЗУЛЬТАТА НА ЭКРАН С УЧЕТОМ МАСШТАБА И СКРОЛЛИНГА
@@ -1108,6 +1138,16 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
         }
     }
 
+    g_srcImgWidth = imgWidth;
+    g_srcImgHeight = imgHeight;
+
+    // Вычисляем новые размеры, кратные 8
+    g_compressedWidth = ((imgWidth + 7) / 8);
+    g_compressedHeight = ((imgHeight + 7) / 8);
+
+    g_paddedImgWidth = g_compressedWidth * 8;
+    g_paddedImgHeight = g_compressedHeight * 8;
+
     // === ЗОЛОТОЕ ПРАВИЛО: ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ БЕЗ УТЕЧЕК! ===
     delete[] pPixelsBuffer;
     pConverter->Release();
@@ -1174,13 +1214,43 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClass(&wc);
 
-    HWND hwnd = CreateWindowEx(0, CLASS_NAME, L"Мой Шейдерный Видеоплеер",
-        WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL, 
+    hwnd = CreateWindowEx(0, CLASS_NAME, L"Мой Шейдерный Видеоплеер",
+        WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 
         800, 600, 
         NULL, NULL, hInstance, NULL);
 
     if (hwnd == NULL) return 0;
+
+    // Инициализируем общие элементы управления Windows
+    InitCommonControls();
+
+    // Физически создаем строку статуса, привязанную к главному окну hwnd
+    g_hStatusWnd = CreateStatusWindow(
+        WS_CHILD | WS_VISIBLE,
+        L"HDR Дефектоскоп готов к работе",
+        hwnd,                                 // Дескриптор вашего окна плеера
+        2005
+    );
+
+    if (g_hStatusWnd != NULL && hwnd != NULL)
+    {
+        // 1. Аппаратно измеряем физическую высоту созданной строки статуса (как в 2004 году!)
+        RECT rS = {};
+        GetWindowRect(g_hStatusWnd, &rS);
+        int statusHeight = rS.bottom - rS.top; // Получили чистую высоту полосы в пикселях
+
+        // 2. Узнаем текущие полные габариты рамы главного окна плеера на экране
+        RECT wndRect = {};
+        GetWindowRect(hwnd, &wndRect);
+        int currentW = wndRect.right - wndRect.left;
+        int currentH = wndRect.bottom - wndRect.top;
+
+        // 3. Расширяем внешнюю коробку окна строго на высоту статус-бара!
+        // Плеер остаётся в своих прежних размерах, а строка статуса ложится ниже ползунков!
+        SetWindowPos(hwnd, NULL, 0, 0, currentW, currentH + statusHeight, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+
     ShowWindow(hwnd, nCmdShow);
 
     CreateAppMenu(hwnd); // НОВОЕ: Физически включаем меню на экране сразу после показа окна
@@ -1191,6 +1261,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         CoUninitialize(); // НОВОЕ: Чисто закрываем и освобождаем ресурсы COM-потока перед выходом!
         return 0;
     }
+
+#ifdef my_DRBUG#
+    CreateDiagnosticWindow(hInstance, hwnd);
+#endif
 
     MSG msg = { };
     while (WM_QUIT != msg.message)
@@ -1609,6 +1683,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     // Принудительно вызываем Render прямо сейчас, 
                     // чтобы протолкнуть новые SRV-интерфейсы в GPU!
                     Render();
+                    wchar_t statusBuf[256];
+
+                    // Подставляем ваши глобальные переменные ширины и высоты кадра плеера
+                    wsprintf(statusBuf, L"Габариты кадра: %d x %d пикселей -> %d x %d -> %d x %d",
+                        g_srcImgWidth, g_srcImgHeight,
+                        g_compressedWidth, g_compressedHeight,
+                        g_paddedImgWidth, g_paddedImgHeight);
+
+                    // Отправляем этот текст в нижний статус-бар!
+                    SendMessage(g_hStatusWnd, SB_SETTEXT, 0, (LPARAM)statusBuf);
                     //RenderSplit(); // Переключили плеер в режим сравнения "До / После"
                 }
                 else
