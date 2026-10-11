@@ -80,6 +80,7 @@ ID3D11Texture2D* g_pStage2Texture = nullptr;
 // === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
 ID3D11PixelShader* g_pPixelShaderDown = nullptr; // Шейдер сжатия 4х4
+ID3D11PixelShader* g_pPixelShaderDown2 = nullptr; // Шейдер сжатия 8х8
 
 // Стадия 1:2
 ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
@@ -352,6 +353,27 @@ HRESULT InitDevice(HWND hwnd)
         return hr;
     }
 
+    // === КОМПИЛЯЦИЯ И СОЗДАНИЕ ШЕЙДЕРА СЖАТИЯ 8х8 ===
+    ID3DBlob* pPSBlobDown8 = nullptr;
+    ID3DBlob* pErrorBlobLocal8 = nullptr;
+
+    hr = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "PS_Downsample8x8", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pPSBlobDown8, &pErrorBlobLocal8);
+    if (FAILED(hr))
+    {
+        if (pErrorBlobLocal8) pErrorBlobLocal8->Release();
+        MessageBox(hwnd, L"Не удалось скомпилировать шейдер PS_Downsample8x8!", L"Ошибка", MB_OK | MB_ICONERROR);
+        return hr;
+    }
+
+    hr = g_pd3dDevice->CreatePixelShader(pPSBlobDown8->GetBufferPointer(), pPSBlobDown8->GetBufferSize(), nullptr, &g_pPixelShaderDown2);
+    pPSBlobDown8->Release();
+    if (FAILED(hr))
+    {
+        MessageBox(hwnd, L"Не удалось создать пиксельный шейдер сжатия 8х8!", L"Ошибка", MB_OK | MB_ICONERROR);
+        return hr;
+    }
+
+
     hr = g_pd3dDevice->CreatePixelShader(pPSBlobDown->GetBufferPointer(), pPSBlobDown->GetBufferSize(), nullptr, &g_pPixelShaderDown);
     pPSBlobDown->Release();
     if (FAILED(hr))
@@ -618,6 +640,64 @@ void Render()
         }
     }
 
+    // === НАСТРОЙКА ОБЛАСТИ ПРОСМОТРА ДЛЯ СТАДИИ 1 (СЖАТИЕ 4х4) ===
+    D3D11_VIEWPORT vpStage1 = {};
+    vpStage1.TopLeftX = 0.0f;
+    vpStage1.TopLeftY = 0.0f;
+    vpStage1.Width = (float)s1Width;   // Ширина в 4 раза меньше оригинала
+    vpStage1.Height = (float)s1Height; // Высота в 4 раза меньше оригинала
+    vpStage1.MinDepth = 0.0f;
+    vpStage1.MaxDepth = 1.0f;
+
+    // === ФИЗИЧЕСКОЕ СОЗДАНИЕ ХОЛСТА ДЛЯ СТАДИИ 2 (СЖАТИЕ 8х8) ===
+    UINT s2Width = (fileWidth / 8 > 0) ? fileWidth / 8 : 1;
+    UINT s2Height = (fileHeight / 8 > 0) ? fileHeight / 8 : 1;
+
+    if (g_pStage2Texture)
+    {
+        D3D11_TEXTURE2D_DESC currentDesc2;
+        g_pStage2Texture->GetDesc(&currentDesc2);
+        if (currentDesc2.Width != s2Width || currentDesc2.Height != s2Height)
+        {
+            if (g_pStageDown8SRV) { g_pStageDown8SRV->Release(); g_pStageDown8SRV = nullptr; }
+            if (g_pStageDown8RTV) { g_pStageDown8RTV->Release(); g_pStageDown8RTV = nullptr; }
+            g_pStage2Texture->Release();
+            g_pStage2Texture = nullptr;
+        }
+    }
+
+    if (g_pStage2Texture == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC descS2 = {};
+        descS2.Width = s2Width;
+        descS2.Height = s2Height;
+        descS2.MipLevels = 1;
+        descS2.ArraySize = 1;
+        descS2.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        descS2.SampleDesc.Count = 1;
+        descS2.SampleDesc.Quality = 0;
+        descS2.Usage = D3D11_USAGE_DEFAULT;
+        descS2.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        descS2.CPUAccessFlags = 0;
+        descS2.MiscFlags = 0;
+
+        HRESULT hr_s2 = g_pd3dDevice->CreateTexture2D(&descS2, nullptr, &g_pStage2Texture);
+        if (SUCCEEDED(hr_s2))
+        {
+            g_pd3dDevice->CreateRenderTargetView(g_pStage2Texture, nullptr, &g_pStageDown8RTV);
+            g_pd3dDevice->CreateShaderResourceView(g_pStage2Texture, nullptr, &g_pStageDown8SRV);
+        }
+    }
+
+    // === НАСТРОЙКА ОБЛАСТИ ПРОСМОТРА ДЛЯ СТАДИИ 2 (СЖАТИЕ 8х8) ===
+    D3D11_VIEWPORT vpStage2 = {};
+    vpStage2.TopLeftX = 0.0f;
+    vpStage2.TopLeftY = 0.0f;
+    vpStage2.Width = (float)s2Width;
+    vpStage2.Height = (float)s2Height;
+    vpStage2.MinDepth = 0.0f;
+    vpStage2.MaxDepth = 1.0f;
+
     // ========================================================================
     // ЭТАП I: ОДНОПРОХОДНЫЙ РАСЧЕТ И СБОРКА ШТОРКИ В ПОЛНЫЙ РАЗМЕР ФАЙЛА
     // ========================================================================
@@ -644,6 +724,24 @@ void Render()
     cbDataLocal.d_height = 1.0f / renderH;
     cbDataLocal.splitX = 0.5f; // Шторка строго по центру full-size кадра
     g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, NULL, &cbDataLocal, 0, 0);
+
+    // ========================================================================
+    // ПАСС НУЛЕВОЙ: ЗАПУСК ПЕРВОГО ШАГА СЖАТИЯ (БЛОКИ 4х4 В КАНАЛЫ R, G, B, A)
+    // ========================================================================
+    float ClearColorS1[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pStageDown4RTV, ClearColorS1);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageDown4RTV, nullptr);
+    g_pImmediateContext->RSSetViewports(1, &vpStage1);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderDown, nullptr, 0);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+    g_pImmediateContext->Draw(4, 0);
+
+    // Разрываем связи после сжатия, подготавливая видеокарту к Пассу А
+    ID3D11ShaderResourceView* nullSRV_S1[] = { nullptr };
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV_S1);
+    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
+
+    g_pImmediateContext->RSSetViewports(1, &vpS3);
 
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);

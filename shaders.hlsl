@@ -304,4 +304,37 @@ float4 PS_Downsample4x4(VS_OUTPUT input) : SV_Target
     return float4(GrayMid, GrayMin, GrayMax, GraySqr);
 }
 
+float4 PS_Downsample8x8(VS_OUTPUT input) : SV_Target
+{
+    float4 k1;
+    float GrayMid = 0.0f;
+    float GrayMin = 1.0f;
+    float GrayMax = 0.0f;
+    float GraySqr = 0.0f;
+    
+    // Обходим блок 2х2 от результатов первой стадии (что дает суммарное сжатие 8х8)
+    for(int i = 0; i < 2; i++)
+    {
+        for(int j = 0; j < 2; j++)
+        {
+            // Читаем данные из текстуры первого шага (используем правильный сэмплер)
+            float2 offset = float2(j * d_width * 4.0f, i * d_height * 4.0f);
+            k1 = srcTexture.Sample(samplerState0, input.Tex + offset);
+            
+            GrayMid += k1.r; // Канал R хранит среднюю яркость блоков 4х4
+            GraySqr += k1.w * k1.w + k1.r * k1.r; // Канал W хранит дисперсию
+            
+            if(k1.g < GrayMin) GrayMin = k1.g; // Канал G хранит минимум
+            if(k1.b > GrayMax) GrayMax = k1.b; // Канал B хранит максимум
+        }
+    }
+    
+    GrayMid /= 4.0f;
+    GraySqr /= 4.0f;
+    GraySqr -= GrayMid * GrayMid;
+    if(GraySqr > 0.0f) GraySqr = sqrt(GraySqr);
+    
+    // Возвращаем финально упакованную макроструктуру 8х8
+    return float4(GrayMid, GrayMin, GrayMax, GraySqr);
+}
 
