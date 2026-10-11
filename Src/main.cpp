@@ -71,8 +71,15 @@ ID3D11ShaderResourceView* g_pStage3SRV = NULL; // Ссылка на этот р�
 ID3D11RenderTargetView* g_pStageMasterRTV = NULL;   // Холст для записи полноразмерной шторки
 ID3D11ShaderResourceView* g_pStageMasterSRV = NULL; // Ссылка на мастер-кадр для последующего сжатия
 
+// Текстуры и холсты для Стадии 1 (сжатие 4х4)
+ID3D11Texture2D* g_pStage1Texture = nullptr;
+
+// Текстуры и холсты для Стадии 2 (сжатие 8х8)
+ID3D11Texture2D* g_pStage2Texture = nullptr;
+
 // === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
+ID3D11PixelShader* g_pPixelShaderDown = nullptr; // Шейдер сжатия 4х4
 
 // Стадия 1:2
 ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
@@ -330,7 +337,35 @@ HRESULT InitDevice(HWND hwnd)
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
-        // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 6-ГО ШЕЙДЕРА (FINAL) ===
+    // === КОМПИЛЯЦИЯ И СОЗДАНИЕ ШЕЙДЕРА СЖАТИЯ 4х4 ===
+    ID3DBlob* pPSBlobDown = nullptr;
+    ID3DBlob* pErrorBlobLocal = nullptr;
+
+    hr = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "PS_Downsample4x4", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pPSBlobDown, &pErrorBlobLocal);
+    if (FAILED(hr))
+    {
+        if (pErrorBlobLocal)
+        {
+            MessageBoxA(hwnd, (char*)pErrorBlobLocal->GetBufferPointer(), "Ошибка HLSL", MB_OK | MB_ICONERROR);
+            pErrorBlobLocal->Release();
+        }
+        return hr;
+    }
+
+    hr = g_pd3dDevice->CreatePixelShader(pPSBlobDown->GetBufferPointer(), pPSBlobDown->GetBufferSize(), nullptr, &g_pPixelShaderDown);
+    pPSBlobDown->Release();
+    if (FAILED(hr))
+    {
+        if (pErrorBlobLocal)
+        {
+            OutputDebugStringA((char*)pErrorBlobLocal->GetBufferPointer());
+            MessageBoxA(hwnd, (char*)pErrorBlobLocal->GetBufferPointer(), "Ошибка HLSL", MB_OK | MB_ICONERROR);
+            pErrorBlobLocal->Release();
+        }
+        return hr;
+    }
+
+    // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 6-ГО ШЕЙДЕРА (FINAL) ===
     ID3DBlob* pPSFinalBlob = NULL;
     // Указываем точку входа "PS_Final" — строго как имя функции в файле shaders.hlsl
     hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Final", "ps_4_0", &pPSFinalBlob);
@@ -538,6 +573,50 @@ void Render()
     }
     float renderW = (float)fileWidth;
     float renderH = (float)fileHeight;
+
+    // Вычисляем размеры для Стадии 1 (строго в 4 раза меньше оригинала)
+    UINT s1Width = (fileWidth / 4 > 0) ? fileWidth / 4 : 1;
+    UINT s1Height = (fileHeight / 4 > 0) ? fileHeight / 4 : 1;
+
+    // Если холст уже существует, но его размеры не совпадают с новыми — пересоздаем его
+    if (g_pStage1Texture)
+    {
+        D3D11_TEXTURE2D_DESC currentDesc;
+        g_pStage1Texture->GetDesc(&currentDesc);
+        if (currentDesc.Width != s1Width || currentDesc.Height != s1Height)
+        {
+            if (g_pStageDown4SRV) { g_pStageDown4SRV->Release(); g_pStageDown4SRV = nullptr; }
+            if (g_pStageDown4RTV) { g_pStageDown4RTV->Release(); g_pStageDown4RTV = nullptr; }
+            g_pStage1Texture->Release();
+            g_pStage1Texture = nullptr;
+        }
+    }
+
+    // Физически выделяем память на видеокарте, если холста еще нет
+    if (g_pStage1Texture == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC descS1 = {};
+        descS1.Width = s1Width;
+        descS1.Height = s1Height;
+        descS1.MipLevels = 1;
+        descS1.ArraySize = 1;
+        descS1.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; // 4 канала для характеристик 2011 года
+        descS1.SampleDesc.Count = 1;
+        descS1.SampleDesc.Quality = 0;
+        descS1.Usage = D3D11_USAGE_DEFAULT;
+        descS1.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        descS1.CPUAccessFlags = 0;
+        descS1.MiscFlags = 0;
+
+        HRESULT hr_s1 = g_pd3dDevice->CreateTexture2D(&descS1, nullptr, &g_pStage1Texture);
+        if (SUCCEEDED(hr_s1))
+        {
+            // Создаем холст для рисования (RTV) на базе вашей чистой заготовки g_pStageDown4RTV
+            g_pd3dDevice->CreateRenderTargetView(g_pStage1Texture, nullptr, &g_pStageDown4RTV);
+            // Создаем ресурс для чтения в шейдерах (SRV) на базе заготовки g_pStageDown4SRV
+            g_pd3dDevice->CreateShaderResourceView(g_pStage1Texture, nullptr, &g_pStageDown4SRV);
+        }
+    }
 
     // ========================================================================
     // ЭТАП I: ОДНОПРОХОДНЫЙ РАСЧЕТ И СБОРКА ШТОРКИ В ПОЛНЫЙ РАЗМЕР ФАЙЛА
