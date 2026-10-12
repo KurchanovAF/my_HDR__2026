@@ -18,8 +18,9 @@ VS_OUTPUT VS(float4 Pos : POSITION, float2 Tex : TEXCOORD)
 // ========================================================================
 
 // Входные ресурсы DirectX 11
-Texture2D srcTexture : register(t0);       // Наш единственный сырой файл
-SamplerState samplerState0 : register(s0); // Point-сэмплер без замыливания
+Texture2D srcTexture : register(t0);        // Наш единственный сырой файл
+Texture2D macroTexture : register(t1);      // Честно сжатая макроструктура 8х8 от GPU
+SamplerState samplerState0 : register(s0);  // Point-сэмплер без замыливания
 
 // Буфер констант (бывший register(c0))
 cbuffer cbData : register(b0)
@@ -38,6 +39,12 @@ static const float3 WEIGHT = float3(0.299f, 0.587f, 0.114f);
 float GetGray(float2 uv)
 {
     return dot(srcTexture.Sample(samplerState0, uv).rgb, WEIGHT);
+}
+
+// Вспомогательная функция чтения макроструктуры 8х8
+float GetMacroGray(float2 uv)
+{
+    return macroTexture.Sample(samplerState0, uv).r; // Читаем уже готовый канал R
 }
 
 // 1. ШЕЙДЕР ДЛЯ ЛЕВОГО ВЕРХНЕГО УЧАСТКА

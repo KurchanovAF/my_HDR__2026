@@ -741,12 +741,30 @@ void Render()
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV_S1);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
 
+    // ========================================================================
+    // ПАСС ПЕРВЫЙ: ЗАПУСК ВТОРОГО ШАГА СЖАТИЯ (МАКРОСТРУКТУРА 8х8 НА БАЗЕ 4х4)
+    // ========================================================================
+    float ClearColorS2[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pStageDown8RTV, ClearColorS2);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageDown8RTV, nullptr);
+    g_pImmediateContext->RSSetViewports(1, &vpStage2);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderDown2, nullptr, 0);
+
+    // Подаем на вход текстуру с результатами первого шага (4х4)
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageDown4SRV);
+    g_pImmediateContext->Draw(4, 0);
+
+    // Разрываем связи после второго шага сжатия
+    g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV_S1);
+    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
+
     g_pImmediateContext->RSSetViewports(1, &vpS3);
 
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStageDown8SRV); // Новый вход t1 с макроструктурой
     g_pImmediateContext->Draw(4, 0);
 
     // Чисто разрываем связи Пасса А
@@ -1439,7 +1457,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         return 0;
     }
 
-#ifdef my_DRBUG#
+#ifdef my_DRBUG
     CreateDiagnosticWindow(hInstance, hwnd);
 #endif
 
