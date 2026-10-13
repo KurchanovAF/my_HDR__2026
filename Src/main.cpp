@@ -114,6 +114,16 @@ UINT g_paddedImgHeight = 0;
 UINT g_compressedWidth = 0;
 UINT g_compressedHeight = 0;
 
+// === НАБОР ФЛАГОВ ДЛЯ ОДНОКРАТНОГО СКАЧИВАНИЯ КАДРА В CPU ===
+bool g_bNeedCopyOriginal = true;    // Флаг для копии исходного цветного файла
+bool g_bNeedCopyStage3 = true;      // Флаг для монохромного кадра (Стадия 3)
+bool g_bNeedCopyCompressed = true;  // Флаг для макроструктуры 8х8 (Стадия 2)
+
+// === ОБЪЯВЛЕНИЕ ВНЕШНИХ ПЕРЕМЕННЫХ ИЗ ПАНЕЛИ ДИАГНОСТИКИ ===
+extern UINT* pPixelsBuffer;
+extern UINT* pRawPixels;
+extern ID3D11Texture2D* g_pTextureStaging;
+
 #define my_DRBUG
 #ifdef my_DEBUG
 #include my_debug.c
@@ -1064,6 +1074,12 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 {
     HRESULT hr = S_OK;
 
+    // Переключаем флаги: принудительно просим видеокарту сделать 
+    // один свежий слепок нового файла для панели диагностики
+    g_bNeedCopyOriginal = true;
+    g_bNeedCopyStage3 = true;
+    g_bNeedCopyCompressed = true;
+
     // 1. Создаем фабрику декодеров WIC
     IWICImagingFactory* pWICFactory = NULL;
     hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (LPVOID*)&pWICFactory);
@@ -1097,8 +1113,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     UINT paddedHeight = ((imgHeight + 7) / 8) * 8;
 
     // Выделяем буфер под расширенный кадр и временный под сырые пиксели
-    UINT* pPixelsBuffer = new UINT[paddedWidth * paddedHeight];
-    UINT* pRawPixels = new UINT[imgWidth * imgHeight];
+    pPixelsBuffer = new UINT[paddedWidth * paddedHeight];
+    pRawPixels = new UINT[imgWidth * imgHeight];
 
     hr = pConverter->CopyPixels(NULL, imgWidth * sizeof(UINT), imgWidth * imgHeight * sizeof(UINT), (BYTE*)pRawPixels);
 
@@ -1112,9 +1128,13 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             {
                 UINT srcX = (x < imgWidth) ? x : (imgWidth - 1);
                 pPixelsBuffer[y * paddedWidth + x] = pRawPixels[srcY * imgWidth + srcX];
+                if (::pRawPixels != nullptr && srcY < imgHeight && srcX < imgWidth)
+                {
+                    ::pRawPixels[srcY * imgWidth + srcX] = pRawPixels[srcY * imgWidth + srcX];
+                }
             }
         }
-        delete[] pRawPixels; // Удаляем временный сырой буфер
+//        delete[] pRawPixels; // Удаляем временный сырой буфер
 
         // 6. Если старая основная текстура уже была в памяти — чисто освобождаем её
         if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
@@ -1294,8 +1314,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     }
 
     // ========================================================================
-// НАСТРОЙКА ДИАПАЗОНОВ С КРОЛЛИНГА ПОД РАЗМЕР КАРТИНКИ
-// ========================================================================
+    // НАСТРОЙКА ДИАПАЗОНОВ С КРОЛЛИНГА ПОД РАЗМЕР КАРТИНКИ
+    // ========================================================================
     if (SUCCEEDED(hr))
     {
         // Сохраняем размеры файла для обработчика прокрутки
@@ -1342,6 +1362,29 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
     g_paddedImgWidth = g_compressedWidth * 8;
     g_paddedImgHeight = g_compressedHeight * 8;
+
+    // === ЗАПОЛНЕНИЕ ОТЛАДОЧНОГО МАССИВА ПРИ ОТКРЫТИИ ФАЙЛА ===
+    if (g_currentImgWidth > 0 && g_currentImgHeight > 0)
+    {
+        // 1. Освобождаем старую память массива, если она была выделена ранее
+        if (pRawPixels != nullptr) { delete[] pRawPixels; pRawPixels = nullptr; }
+
+        // 2. Выделяем чистую оперативную память строго под габариты новой картинки
+        pRawPixels = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+        // Дальше идет ваш родной цикл без изменений
+        for (UINT y = 0; y < g_currentImgHeight; y++)
+        {
+            for (UINT x = 0; x < g_currentImgWidth; x++)
+            {
+                UINT idx = y * g_currentImgWidth + x;
+                if (pPixelsBuffer)
+                {
+                    pRawPixels[idx] = pPixelsBuffer[idx];
+                }
+            }
+        }
+    }
 
     // === ЗОЛОТОЕ ПРАВИЛО: ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ БЕЗ УТЕЧЕК! ===
     delete[] pPixelsBuffer;

@@ -140,8 +140,8 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="my_debug.cpp" />
     <ClCompile Include="Src\main.cpp" />
+    <ClCompile Include="Src\my_debug.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="shaders.hlsl">

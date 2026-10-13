@@ -41,127 +41,104 @@ float GetGray(float2 uv)
     return dot(srcTexture.Sample(samplerState0, uv).rgb, WEIGHT);
 }
 
-// Вспомогательная функция чтения макроструктуры 8х8
-float GetMacroGray(float2 uv)
+// Новая функция: читает пиксель напрямую по его матричному индексу
+float GetMacroGray(int2 pos)
 {
-    return macroTexture.Sample(samplerState0, uv).r; // Читаем уже готовый канал R
+    // Зажимаем индексы от 0 до максимального размера сжатого буфера (width/8 - 1)
+    // чтобы видеокарта никогда не выходила за границы памяти
+    int max_x = (int)(width / 8.0f) - 1;
+    int max_y = (int)(height / 8.0f) - 1;
+    
+    int cl_x = clamp(pos.x, 0, max_x);
+    int cl_y = clamp(pos.y, 0, max_y);
+
+    // .Load берет точную ячейку памяти. Третий параметр (0) - это мип-уровень.
+    return macroTexture.Load(int3(cl_x, cl_y, 0)).r;
 }
 
-// 1. ШЕЙДЕР ДЛЯ ЛЕВОГО ВЕРХНЕГО УЧАСТКА
+// 1. ЛЕВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
 float4 func_LT(float2 tex_in)
 {
-    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
-    float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
-    float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-
-    float2 tex_LR   = tex_in_3 - float2(d_width, 0.0f);
-    float2 tex_TB   = tex_in_3 - float2(0.0f, d_height);
-    float2 tex_LRTB = tex_in_3 - float2(d_width, d_height);
+    int tex_x = (int)floor(width * tex_in.x) / 8;
+    int tex_y = (int)floor(height * tex_in.y) / 8;
 
     float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
-    float k_S    = GetGray(tex_in_3);
-    float k_LR   = GetGray(tex_LR);
-    float k_TB   = GetGray(tex_TB);
-    float k_LRTB = GetGray(tex_LRTB);
+    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
+    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
+    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
 
-    int i_x = round((tex_in + 4.0f * d_xy) * width);
-    int i_y = round((tex_in + 4.0f * d_xy) * height);
-    i_x = (i_x % 4) * 2;
-    i_y = (i_y % 4) * 2;
+    int i_x = (int)(round(width * tex_in.x) % 8); 
+    int i_y = (int)(round(height * tex_in.y) % 8);
 
-        // Коэффициенты: 9 и 7
-    float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (9 + i_y) +
-                  (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
+                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
 
     float out_gray = saturate(k1 - k_SS + 0.5f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// 2. ШЕЙДЕР ДЛЯ ПРАВОГО ВЕРХНОГО УЧАСТКА
+// 2. ПРАВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
 float4 func_RT(float2 tex_in)
 {
-    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
-    float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
-    float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
+    int tex_x = (int)floor(width * tex_in.x) / 8;
+    int tex_y = (int)floor(height * tex_in.y) / 8;
 
-    float2 tex_LR   = tex_in_3 + float2(d_width, 0.0f);
-    float2 tex_TB   = tex_in_3 - float2(0.0f, d_height);
-    float2 tex_LRTB = tex_in_3 + float2(d_width, -d_height);
+    float k1     = GetGray(tex_in + 2.0f * float2(-d_width, d_height));
+    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
+    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
+    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
 
-    float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
-    float k_S    = GetGray(tex_in_3);
-    float k_LR   = GetGray(tex_LR);
-    float k_TB   = GetGray(tex_TB);
-    float k_LRTB = GetGray(tex_LRTB);
+    int i_x = (int)(round(width * tex_in.x) % 8); 
+    int i_y = (int)(round(height * tex_in.y) % 8);
 
-    int i_x = round((tex_in + 4.0f * d_xy) * width);
-    int i_y = round((tex_in + 4.0f * d_xy) * height);
-    i_x = (i_x % 4) * 2;
-    i_y = (i_y % 4) * 2;
-
-        // Коэффициенты: 15, 1, 9, 7
-    float k_SS = ((k_S * (15 - i_x) + k_LR * (1 + i_x)) * (9 + i_y) +
-                  (k_TB * (15 - i_x) + k_LRTB * (1 + i_x)) * (7 - i_y)) / 256.0f;
+    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
+                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
 
     float out_gray = saturate(k1 - k_SS + 0.5f);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// 3. ШЕЙДЕР ДЛЯ ПРАВОГО НИЖНЕГО УЧАСТКА
-float4 func_RB(float2 tex_in)
-{
-    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
-    float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
-    float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
-
-    float2 tex_LR   = tex_in_3 + float2(d_width, 0.0f);
-    float2 tex_TB   = tex_in_3 + float2(0.0f, d_height);
-    float2 tex_LRTB = tex_in_3 + float2(d_width, d_height);
-
-    float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
-    float k_S    = GetGray(tex_in_3);
-    float k_LR   = GetGray(tex_LR);
-    float k_TB   = GetGray(tex_TB);
-    float k_LRTB = GetGray(tex_LRTB);
-
-    int i_x = round((tex_in + 4.0f * d_xy) * width);
-    int i_y = round((tex_in + 4.0f * d_xy) * height);
-    i_x = (i_x % 4) * 2;
-    i_y = (i_y % 4) * 2;
-
-        // Коэффициенты: 15, 1, 15, 1
-    float k_SS = ((k_S * (15 - i_x) + k_LR * (1 + i_x)) * (15 - i_y) +
-                  (k_TB * (15 - i_x) + k_LRTB * (1 + i_x)) * (1 + i_y)) / 256.0f;
-
-    float out_gray = saturate(k1 - k_SS + 0.5f);
-    return float4(out_gray, out_gray, out_gray, 1.0f);
-}
-
-// 4. ШЕЙДЕР ДЛЯ ЛЕВContextОГО НИЖНЕГО УЧАСТКА
+// 3. ЛЕВЫЙ НИЖНИЙ ПИКСЕЛЬ
 float4 func_LB(float2 tex_in)
 {
-    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
-    float2 tex_8 = (tex_in - 4.0f * d_xy) / 8.0f;
-    float2 tex_in_3 = d_xy + tex_8 + float2(0.25f, 0.75f);
+    int tex_x = (int)floor(width * tex_in.x) / 8;
+    int tex_y = (int)floor(height * tex_in.y) / 8;
 
-    float2 tex_LR   = tex_in_3 - float2(d_width, 0.0f);
-    float2 tex_TB   = tex_in_3 + float2(0.0f, d_height);
-    float2 tex_LRTB = tex_in_3 - float2(d_width, -d_height);
+    float k1     = GetGray(tex_in + 2.0f * float2(d_width, -d_height));
+    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
+    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
+    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
 
-    float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
-    float k_S    = GetGray(tex_in_3);
-    float k_LR   = GetGray(tex_LR);
-    float k_TB   = GetGray(tex_TB);
-    float k_LRTB = GetGray(tex_LRTB);
+    int i_x = (int)(round(width * tex_in.x) % 8); 
+    int i_y = (int)(round(height * tex_in.y) % 8);
 
-    int i_x = round((tex_in + 4.0f * d_xy) * width);
-    int i_y = round((tex_in + 4.0f * d_xy) * height);
-    i_x = (i_x % 4) * 2;
-    i_y = (i_y % 4) * 2;
+    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
+                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
 
-        // Коэффициенты: 9, 7, 15, 1
-    float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (15 - i_y) +
-                  (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (1 + i_y)) / 256.0f;
+    float out_gray = saturate(k1 - k_SS + 0.5f);
+    return float4(out_gray, out_gray, out_gray, 1.0f);
+}
+
+// 4. ПРАВЫЙ НИЖНИЙ ПИКСЕЛЬ
+float4 func_RB(float2 tex_in)
+{
+    int tex_x = (int)floor(width * tex_in.x) / 8;
+    int tex_y = (int)floor(height * tex_in.y) / 8;
+
+    float k1     = GetGray(tex_in + 2.0f * float2(-d_width, -d_height));
+    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
+    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
+    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
+
+    int i_x = (int)(round(width * tex_in.x) % 8); 
+    int i_y = (int)(round(height * tex_in.y) % 8);
+
+    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
+                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
 
     float out_gray = saturate(k1 - k_SS + 0.5f);
     return float4(out_gray, out_gray, out_gray, 1.0f);

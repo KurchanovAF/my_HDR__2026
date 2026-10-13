@@ -294,7 +294,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                     UINT rowOffset = y * g_currentImgWidth;
                     for (UINT x = startX; x < endX; x++)
                     {
-                        DWORD color = pPixelsBuffer[rowOffset + x];
+                        DWORD color = pRawPixels[rowOffset + x];
                         BYTE b = (BYTE)(color & 0xFF);
                         BYTE g = (BYTE)((color >> 8) & 0xFF);
                         BYTE r = (BYTE)((color >> 16) & 0xFF);
@@ -343,7 +343,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                     UINT rowOffset = y * g_currentImgWidth;
                     for (UINT x = startX; x < endX; x++)
                     {
-                        DWORD color = pPixelsBuffer[rowOffset + x];
+                        DWORD color = pRawPixels[rowOffset + x];
                         BYTE b = (BYTE)(color & 0xFF);
                         BYTE g = (BYTE)((color >> 8) & 0xFF);
                         BYTE r = (BYTE)((color >> 16) & 0xFF);
@@ -365,58 +365,74 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
         }
         break;
-        case 2: // Режим 3: Сжатый в 8 раз (ВЫВОД БЛОКА ПАМЯТИ ЦЕЛИКОМ ЗА 0 СЕКУНД)
+        case 2: // Режим 3: Сжатый в 8 раз (ВЫВОД ЧЕРЕЗ БЫСТРЫЙ BITBLT)
         {
             if (pCompressedBuffer8x != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
                 UINT compressedW = g_currentImgWidth / 8;
                 UINT compressedH = g_currentImgHeight / 8;
-
-                UINT startX = (UINT)g_dlgScrollX_8x8;
-                UINT startY = (UINT)g_dlgScrollY_8x8;
+                int startX = g_dlgScrollX_8x8;
+                int startY = g_dlgScrollY_8x8;
 
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
                 int winW = rcClient.right - rcClient.left;
                 int winH = rcClient.bottom - rcClient.top;
-
                 if (winW <= 0 || winH <= 0) break;
 
-                // Описываем для Windows структуру нашего блока памяти в ОЗУ (DIB)
+                // 1. Создаем временный контекст в памяти, совместимый с экраном панели
+                HDC hMemDC = CreateCompatibleDC(hdc);
+
+                // 2. Описываем структуру пикселей для создания совместимого холста (DIB)
                 BITMAPINFO bmi = {};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
                 bmi.bmiHeader.biWidth = compressedW;
-                // Отрицательная высота biHeight заставляет Windows читать массив сверху вниз (как у нас в ОЗУ)
-                bmi.bmiHeader.biHeight = -(int)compressedH;
+                bmi.bmiHeader.biHeight = -(int)compressedH; // Читаем массив сверху вниз
                 bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32; // Честные 32 бита (DWORD на пиксель)
+                bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = BI_RGB;
 
-                // ИСПРАВЛЕНИЕ: Вычисляем реальный физический остаток пикселей в буфере памяти ОЗУ,
-                // который мы можем безопасно прочитать без переполнения WinAPI!
-                int viewW = ((startX + winW) > compressedW) ? (int)(compressedW - startX) : winW;
-                int viewH = ((startY + winH) > compressedH) ? (int)(compressedH - startY) : winH;
+                // 3. Создаем физический холст Windows HBITMAP на основе нашего массива пикселей
+                void* pBits = nullptr;
+                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                if (hBmp && pBits)
+                {
+                    // Копируем данные из нашего буфера ОЗУ прямо в память холста Windows
+                    memcpy(pBits, pCompressedBuffer8x, compressedW * compressedH * sizeof(UINT));
 
-                // Очищаем фон окна от старых остатков
-                HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-                FillRect(hdc, &rcClient, hBg);
-                DeleteObject(hBg);
+                    // 4. Выбираем холст в созданный контекст памяти
+                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
-                // Передаем блок данных. Высота источника и назначения теперь синхронизированы 
-                // с доступным остатком памяти кадра viewH!
-                StretchDIBits(
-                    hdc,
-                    0, 0, viewW, viewH,           // Куда выводим на экране панели (левый верхний угол)
-                    (int)startX, (int)startY,     // Откуда начинаем считывание из массива в ОЗУ
-                    viewW, viewH,                 // Сколько пикселей считываем по осям X и Y
-                    pCompressedBuffer8x,          // Указатель на массив пикселей кадра
-                    &bmi,
-                    DIB_RGB_COLORS,
-                    SRCCOPY
-                );
+                    // Очищаем фон окна под обрезку кадра
+                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                    FillRect(hdc, &rcClient, hBg);
+                    DeleteObject(hBg);
+
+                    // 5. МГНОВЕННОЕ И БЫСТРОЕ КОПИРОВАНИЕ БИТ В БИТ
+                    // Вычисляем, сколько пикселей физически помещается в окно
+                    int viewW = ((startX + winW) > (int)compressedW) ? (int)(compressedW - startX) : winW;
+                    int viewH = ((startY + winH) > (int)compressedH) ? (int)(compressedH - startY) : winH;
+
+                    BitBlt(
+                        hdc,     // Куда рисуем (экран панели отладки)
+                        0, 0,    // Левый верхний угол приемника
+                        viewW, viewH, // Размеры копируемого блока пикселей
+                        hMemDC,  // Откуда берем (наш контекст с макроструктурой)
+                        startX, startY, // Координаты смещения ползунков в источнике
+                        SRCCOPY  // Флаг прямого попиксельного переноса памяти
+                    );
+
+                    // 6. Наводим порядок в системе: возвращаем старый объект и удаляем холст
+                    SelectObject(hMemDC, hOldBmp);
+                    DeleteObject(hBmp);
+                }
+
+                // Удаляем временный контекст памяти
+                DeleteDC(hMemDC);
             }
         }
         break;
+
         case 3: hBrush = CreateSolidBrush(RGB(0, 120, 30));    // Режим 3 - Зеленый
             break;
         case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
