@@ -123,7 +123,8 @@ bool g_bNeedCopyCompressed = true;  // Флаг для макрострукту�
 extern UINT* pPixelsBuffer;
 extern UINT* pRawPixels;
 extern ID3D11Texture2D* g_pTextureStaging;
-extern UINT* pCompressedBuffer8x; // Внешний буфер сжатия из my_debug.cpp
+extern UINT* pCompressedBuffer8x;   // Внешний буфер сжатия из my_debug.cpp
+extern UINT* pStretchedBuffer;      // Буфер для хранения кадра, растянутого обратно после сжатия
 
 #define my_DRBUG
 #ifdef my_DEBUG
@@ -1164,8 +1165,14 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             hr = g_pd3dDevice->CreateShaderResourceView(pTexture, NULL, &g_pTextureSRV);
             pTexture->Release();
 
-        g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
-        g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
+            g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
+            g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
+            // Выделяем память для Режима 4 на основе точных размеров, принятых плеером
+            if (g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            {
+                if (::pStretchedBuffer != nullptr) { delete[] ::pStretchedBuffer; ::pStretchedBuffer = nullptr; }
+                ::pStretchedBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
+            }
         }
 
         // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
@@ -1440,6 +1447,53 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
                 BYTE finalGray = (BYTE)(GrayMid * 255.0f);
                 pCompressedBuffer8x[mY * compW + mX] = (finalGray << 16) | (finalGray << 8) | finalGray;
+            }
+        }
+    }
+
+    // === ЭТАЛОННЫЙ РАСЧЕТ РАСТЯНУТОГО ФОНА ДЛЯ РЕЖИМА 4 ===
+    if (pRawPixels && pCompressedBuffer8x && ::pStretchedBuffer && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+    {
+        UINT compW = g_currentImgWidth / 8;
+        UINT compH = g_currentImgHeight / 8;
+
+        for (UINT y = 0; y < g_currentImgHeight; y++)
+        {
+            for (UINT x = 0; x < g_currentImgWidth; x++)
+            {
+                // Воспроизводим целочисленные сдвиги фаз дефектоскопа 2011 года
+                int tex0_x = (int)x - 2;
+                int tex0_y = (int)y - 2;
+
+                int tex_x_base = (int)round((float)tex0_x / 4.0f);
+                int tex_y_base = (int)round((float)tex0_y / 4.0f);
+
+                int tex_x = tex_x_base / 2;
+                int tex_y = tex_y_base / 2;
+
+                int i_x = (tex_x_base % 2) * 4;
+                int i_y = (tex_y_base % 2) * 4;
+
+                // Лямбда-функция безопасного чтения макроблоков с ограничением краев кадра
+                auto GetBufferGray = [&](int bx, int by) -> float {
+                    int cl_x = (bx < 0) ? 0 : ((bx >= (int)compW) ? (int)compW - 1 : bx);
+                    int cl_y = (by < 0) ? 0 : ((by >= (int)compH) ? (int)compH - 1 : by);
+                    return (float)(pCompressedBuffer8x[cl_y * compW + cl_x] & 0xFF) / 255.0f;
+                    };
+
+                float k_S = GetBufferGray(tex_x, tex_y);
+                float k_LR = GetBufferGray(tex_x + 1, tex_y);
+                float k_TB = GetBufferGray(tex_x, tex_y + 1);
+                float k_LRTB = GetBufferGray(tex_x + 1, tex_y + 1);
+
+                // Фирменное плавное смешивание четырех макроблоков с весами 9 и 7
+                float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
+                    (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+
+                BYTE finalStretchedGray = (BYTE)(k_SS * 255.0f);
+
+                // Записываем результат в наш глобальный полноразмерный массив Режима 4
+                ::pStretchedBuffer[y * g_currentImgWidth + x] = (finalStretchedGray << 16) | (finalStretchedGray << 8) | finalStretchedGray;
             }
         }
     }

@@ -438,14 +438,13 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 3: // Режим 4: Сжатый в 4 раза (СТАДИЯ 1 НА БАЗЕ BITBLT)
+        case 3: // Режим 4: Растянутый после сжатия (ПОЛНОСТЬЮ АВТОНОМНЫЙ ВЫВОД)
         {
             if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                UINT compressedW = g_currentImgWidth / 4;
-                UINT compressedH = g_currentImgHeight / 4;
-                int startX = g_dlgScrollX_8x8; // Используем те же ползунки для простоты
-                int startY = g_dlgScrollY_8x8;
+                // В отличие от Режима 3, этот буфер полноразмерный (imgWidth x imgHeight)
+                UINT startX = (UINT)g_dlgScrollX_8x8;
+                UINT startY = (UINT)g_dlgScrollY_8x8;
 
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
@@ -453,35 +452,32 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 int winH = rcClient.bottom - rcClient.top;
                 if (winW <= 0 || winH <= 0) break;
 
-                HDC hMemDC = CreateCompatibleDC(hdc);
                 BITMAPINFO bmi = {};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                bmi.bmiHeader.biWidth = compressedW;
-                bmi.bmiHeader.biHeight = -(int)compressedH;
+                bmi.bmiHeader.biWidth = g_currentImgWidth;
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight; // Сверху вниз
                 bmi.bmiHeader.biPlanes = 1;
                 bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = BI_RGB;
 
-                void* pBits = nullptr;
-                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-                if (hBmp && pBits)
-                {
-                    memcpy(pBits, pStretchedBuffer, compressedW * compressedH * sizeof(UINT));
-                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
+                int viewW = ((startX + (UINT)winW) > g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
+                int viewH = ((startY + (UINT)winH) > g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
 
-                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-                    FillRect(hdc, &rcClient, hBg);
-                    DeleteObject(hBg);
+                HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                FillRect(hdc, &rcClient, hBg);
+                DeleteObject(hBg);
 
-                    int viewW = ((startX + winW) > (int)compressedW) ? (int)(compressedW - startX) : winW;
-                    int viewH = ((startY + winH) > (int)compressedH) ? (int)(compressedH - startY) : winH;
-
-                    BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
-
-                    SelectObject(hMemDC, hOldBmp);
-                    DeleteObject(hBmp);
-                }
-                DeleteDC(hMemDC);
+                // Стреляем сырым массивом pStretchedBuffer, не трогая контексты Режима 3
+                StretchDIBits(
+                    hdc,
+                    0, 0, viewW, viewH,
+                    (int)startX, (int)startY,
+                    viewW, viewH,
+                    pStretchedBuffer,
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    SRCCOPY
+                );
             }
         }
         break;
