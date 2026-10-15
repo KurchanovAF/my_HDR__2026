@@ -59,15 +59,14 @@ float GetMacroGray(int2 pos)
 // 1. ЛЕВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
 float4 func_LT(float2 tex_in)
 {
-    float2 tex0_local = float2(tex_in.x - 2.0f * d_width, tex_in.y - 2.0f * d_height);
-    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
-    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
+    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
     
     int tex_x = tex_x_base / 2;
     int tex_y = tex_y_base / 2;
 
-    int i_x = (tex_x_base % 2) * 4; 
-    int i_y = (tex_y_base % 2) * 4;
+    int i_x = (int)(floor(width * tex_in.x) % 8);
+    int i_y = (int)(floor(height * tex_in.y) % 8);
 
     float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
     float k_S    = GetMacroGray(int2(tex_x,     tex_y));
@@ -85,15 +84,14 @@ float4 func_LT(float2 tex_in)
 // 2. ПРАВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
 float4 func_RT(float2 tex_in)
 {
-    float2 tex0_local = float2(tex_in.x - 2.0f * d_width, tex_in.y - 2.0f * d_height);
-    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
-    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
+    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
     
     int tex_x = tex_x_base / 2;
     int tex_y = tex_y_base / 2;
 
-    int i_x = (tex_x_base % 2) * 4; 
-    int i_y = (tex_y_base % 2) * 4;
+    int i_x = (int)(floor(width * tex_in.x) % 8);
+    int i_y = (int)(floor(height * tex_in.y) % 8);
 
     float k1     = GetGray(tex_in + 2.0f * float2(-d_width, d_height));
     float k_S    = GetMacroGray(int2(tex_x,     tex_y));
@@ -111,15 +109,14 @@ float4 func_RT(float2 tex_in)
 // 3. ЛЕВЫЙ НИЖНИЙ ПИКСЕЛЬ
 float4 func_LB(float2 tex_in)
 {
-    float2 tex0_local = float2(tex_in.x - 2.0f * d_width, tex_in.y - 2.0f * d_height);
-    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
-    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
+    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
     
     int tex_x = tex_x_base / 2;
     int tex_y = tex_y_base / 2;
 
-    int i_x = (tex_x_base % 2) * 4; 
-    int i_y = (tex_y_base % 2) * 4;
+    int i_x = (int)(floor(width * tex_in.x) % 8);
+    int i_y = (int)(floor(height * tex_in.y) % 8);
 
     float k1     = GetGray(tex_in + 2.0f * float2(d_width, -d_height));
     float k_S    = GetMacroGray(int2(tex_x,     tex_y));
@@ -137,15 +134,14 @@ float4 func_LB(float2 tex_in)
 // 4. ПРАВЫЙ НИЖНИЙ ПИКСЕЛЬ
 float4 func_RB(float2 tex_in)
 {
-    float2 tex0_local = float2(tex_in.x - 2.0f * d_width, tex_in.y - 2.0f * d_height);
-    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
-    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
+    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
     
     int tex_x = tex_x_base / 2;
     int tex_y = tex_y_base / 2;
 
-    int i_x = (tex_x_base % 2) * 4; 
-    int i_y = (tex_y_base % 2) * 4;
+    int i_x = (int)(floor(width * tex_in.x) % 8);
+    int i_y = (int)(floor(height * tex_in.y) % 8);
 
     float k1     = GetGray(tex_in + 2.0f * float2(-d_width, -d_height));
     float k_S    = GetMacroGray(int2(tex_x,     tex_y));

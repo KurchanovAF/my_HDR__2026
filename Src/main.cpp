@@ -1167,7 +1167,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
             g_currentImgWidth = paddedWidth;   // Строго paddedWidth (184)! Никаких imgWidth.
             g_currentImgHeight = paddedHeight; // Строго paddedHeight (184)!
-            // Выделяем память для Режима 4 на основе точных размеров, принятых плеером
+            // Выделяем память для Режима 4 на основе точных размеров, принятых плееромФ
             if (g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
                 if (::pStretchedBuffer != nullptr) { delete[] ::pStretchedBuffer; ::pStretchedBuffer = nullptr; }
@@ -1486,9 +1486,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 float k_TB = GetBufferGray(tex_x, tex_y + 1);
                 float k_LRTB = GetBufferGray(tex_x + 1, tex_y + 1);
 
-                // Фирменное плавное смешивание четырех макроблоков с весами 9 и 7
-                float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
-                    (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+                float k_SS = ((k_S * (8 - i_x) + k_LR * i_x) * (8 - i_y) +
+                    (k_TB * (8 - i_x) + k_LRTB * i_x) * i_y) / 64.0f;
 
                 BYTE finalStretchedGray = (BYTE)(k_SS * 255.0f);
 

@@ -443,8 +443,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
                 // В отличие от Режима 3, этот буфер полноразмерный (imgWidth x imgHeight)
-                UINT startX = (UINT)g_dlgScrollX_8x8;
-                UINT startY = (UINT)g_dlgScrollY_8x8;
+                UINT startX = (UINT)g_dlgScrollX;
+                UINT startY = (UINT)g_dlgScrollY;
 
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
