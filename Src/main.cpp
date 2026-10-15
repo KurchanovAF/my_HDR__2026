@@ -123,6 +123,7 @@ bool g_bNeedCopyCompressed = true;  // Флаг для макрострукту�
 extern UINT* pPixelsBuffer;
 extern UINT* pRawPixels;
 extern ID3D11Texture2D* g_pTextureStaging;
+extern UINT* pCompressedBuffer8x; // Внешний буфер сжатия из my_debug.cpp
 
 #define my_DRBUG
 #ifdef my_DEBUG
@@ -1382,6 +1383,63 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 {
                     pRawPixels[idx] = pPixelsBuffer[idx];
                 }
+            }
+        }
+    }
+
+    // === ЭТАЛОННЫЙ РАСЧЕТ МАКРОСТРУКТУРЫ 8х8 (ИЗ 2011 ГОДА) ДЛЯ РЕЖИМА 3 ===
+    if (pRawPixels && imgWidth > 0 && imgHeight > 0)
+    {
+        UINT compW = imgWidth / 8;
+        UINT compH = imgHeight / 8;
+
+        // 1. Безопасно перевыделяем память под сжатый буфер в ОЗУ
+        if (pCompressedBuffer8x != nullptr) { delete[] pCompressedBuffer8x; pCompressedBuffer8x = nullptr; }
+        pCompressedBuffer8x = new UINT[compW * compH];
+
+        float WEIGHT_R = 0.299f, WEIGHT_G = 0.587f, WEIGHT_B = 0.114f;
+
+        for (UINT mY = 0; mY < compH; mY++)
+        {
+            for (UINT mX = 0; mX < compW; mX++)
+            {
+                float GrayMid = 0.0f;
+                float GrayMin = 1.0f;
+                float GrayMax = 0.0f;
+                float GraySqr = 0.0f;
+
+                for (UINT i = 0; i < 8; i++)
+                {
+                    for (UINT j = 0; j < 8; j++)
+                    {
+                        UINT pixelX = mX * 8 + j;
+                        UINT pixelY = mY * 8 + i;
+
+                        if (pixelX < imgWidth && pixelY < imgHeight)
+                        {
+                            DWORD clr = pRawPixels[pixelY * imgWidth + pixelX];
+                            BYTE r = (clr >> 16) & 0xFF;
+                            BYTE g = (clr >> 8) & 0xFF;
+                            BYTE b = clr & 0xFF;
+
+                            float GreyValue = (r * WEIGHT_R + g * WEIGHT_G + b * WEIGHT_B) / 255.0f;
+
+                            GrayMid += GreyValue;
+                            GraySqr += GreyValue * GreyValue;
+
+                            if (GreyValue > GrayMax) GrayMax = GreyValue;
+                            if (GreyValue < GrayMin) GrayMin = GreyValue;
+                        }
+                    }
+                }
+
+                GrayMid /= 64.0f;
+                GraySqr /= 64.0f;
+                GraySqr -= GrayMid * GrayMid;
+                if (GraySqr > 0.0f) GraySqr = sqrt(GraySqr);
+
+                BYTE finalGray = (BYTE)(GrayMid * 255.0f);
+                pCompressedBuffer8x[mY * compW + mX] = (finalGray << 16) | (finalGray << 8) | finalGray;
             }
         }
     }

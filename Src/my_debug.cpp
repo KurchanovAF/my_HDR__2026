@@ -240,7 +240,12 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 }
             }
             wchar_t titleBuf[128];
-            wsprintf(titleBuf, L"HDR Дефектоскоп — Активен Режим %d", g_diagMode + 1);
+            // Выводим физические размеры сжатых буферов прямо в заголовок для диагностики
+            wsprintf(titleBuf, L"Режим %d | Буфер 4х4: %dx%d | Буфер 8х8: %dx%d",
+                g_diagMode + 1,
+                g_currentImgWidth / 4, g_currentImgHeight / 4,
+                g_currentImgWidth / 8, g_currentImgHeight / 8);
+
             SetWindowText(hWnd, titleBuf);
             UpdateDlgScrollbars(hWnd); // Перестраиваем диапазоны ползунков под выбранный режим кадра
 
@@ -433,8 +438,54 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 3: hBrush = CreateSolidBrush(RGB(0, 120, 30));    // Режим 3 - Зеленый
-            break;
+        case 3: // Режим 4: Сжатый в 4 раза (СТАДИЯ 1 НА БАЗЕ BITBLT)
+        {
+            if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            {
+                UINT compressedW = g_currentImgWidth / 4;
+                UINT compressedH = g_currentImgHeight / 4;
+                int startX = g_dlgScrollX_8x8; // Используем те же ползунки для простоты
+                int startY = g_dlgScrollY_8x8;
+
+                RECT rcClient;
+                GetClientRect(hWnd, &rcClient);
+                int winW = rcClient.right - rcClient.left;
+                int winH = rcClient.bottom - rcClient.top;
+                if (winW <= 0 || winH <= 0) break;
+
+                HDC hMemDC = CreateCompatibleDC(hdc);
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = compressedW;
+                bmi.bmiHeader.biHeight = -(int)compressedH;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+
+                void* pBits = nullptr;
+                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                if (hBmp && pBits)
+                {
+                    memcpy(pBits, pStretchedBuffer, compressedW * compressedH * sizeof(UINT));
+                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
+
+                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                    FillRect(hdc, &rcClient, hBg);
+                    DeleteObject(hBg);
+
+                    int viewW = ((startX + winW) > (int)compressedW) ? (int)(compressedW - startX) : winW;
+                    int viewH = ((startY + winH) > (int)compressedH) ? (int)(compressedH - startY) : winH;
+
+                    BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
+
+                    SelectObject(hMemDC, hOldBmp);
+                    DeleteObject(hBmp);
+                }
+                DeleteDC(hMemDC);
+            }
+        }
+        break;
+
         case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
             break;
         }
