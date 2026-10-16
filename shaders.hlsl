@@ -215,36 +215,79 @@ float4 PS_Downsample2X(VS_OUTPUT input) : SV_Target
 }
 
 // ========================================================================
-// АППАРАТНЫЙ РЕЖИМ 4: ВОССТАНОВЛЕНИЕ И РАСТЯЖЕНИЕ МАКРОСТРУКТУРЫ НА GPU
+// АППАРАТНЫЙ РЕЖИМ 4: ТОЧНАЯ МАТЕМАТИКА ЧЕТЫРЕХ КВАДРАНТОВ АНАТОЛИЯ ФЕДОРОВИЧА
 // ========================================================================
 float4 PS_Stage2(VS_OUTPUT input) : SV_Target
 {
-    // Корректируем координаты с учетом аппаратного сдвига (как в Stage3)
+    // 1. Получаем локальные координаты, нормированные на шаг сетки
     float2 tex0_local = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
     
-    // Рассчитываем базовые матричные индексы блоков
-    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
-    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    // Переводим UV-координаты в физическую сетку пикселей кадра
+    float fX = tex0_local.x * width;
+    float fY = tex0_local.y * height;
     
-    int tex_x = tex_x_base / 2;
-    int tex_y = tex_y_base / 2;
+    // Находим базовый индекс макроструктуры 8х8 (в памяти это ячейки сжатого буфера t1)
+    int tex_x = (int)floor(fX / 8.0f);
+    int tex_y = (int)floor(fY / 8.0f);
     
-    // Внутриблочные веса интерполяции (шаг сетки 4х4 внутри макроструктуры 8х8)
-    int i_x = (tex_x_base % 2) * 4; 
-    int i_y = (tex_y_base % 2) * 4;
+    // Вычисляем локальный шаг внутри блока 8х8 (эквивалент i1 и j1 в оригинальном цикле)
+    int j1 = (int)floor(fX) % 8;
+    int i1 = (int)floor(fY) % 8;
+    
+    // Программное укрупнение шага (i1_2 = i1 * 2, j1_2 = j1 * 2 из кода 2011 года)
+    int j1_2 = j1 * 2;
+    int i1_2 = i1 * 2;
+    
+    // Переменные для весов интерполяции
+    int u_x_1 = 0, u_x_2 = 0, u_y_1 = 0, u_y_2 = 0;
+    int2 offset_LRTB = int2(0, 0);
+    
+    // 2. РАЗДЕЛЕНИЕ НА 4 КВАДРАНТА (МАТЕМАТИКА ИЗ ФАЙЛА СТРАНИЦ 37-44)
+    if (i1 < 4 && j1 < 4) 
+    {
+        // ЛЕВЫЙ ВЕРХНИЙ КВАДРАНТ (Страница 37-38)
+        u_y_1 = i1_2 + 9;
+        u_x_1 = j1_2 + 9;
+        offset_LRTB = int2(0, 0); // Читаем текущий блок и соседей вокруг него
+    }
+    else if (i1 < 4 && j1 >= 4)
+    {
+        // ПРАВЫЙ ВЕРХНИЙ КВАДРАНТ (Страница 40)
+        u_y_1 = i1_2 + 9;
+        u_x_1 = 23 - j1_2;
+        offset_LRTB = int2(1, 0);
+    }
+    else if (i1 >= 4 && j1 >= 4)
+    {
+        // ПРАВЫЙ НИЖНИЙ КВАДРАНТ (Страница 42)
+        u_y_1 = 23 - i1_2;
+        u_x_1 = 23 - j1_2;
+        offset_LRTB = int2(1, 1);
+    }
+    else 
+    {
+        // ЛЕВЫЙ НИЖНИЙ КВАДРАНТ (Страница 44)
+        u_y_1 = 23 - i1_2;
+        u_x_1 = j1_2 + 9;
+        offset_LRTB = int2(0, 1);
+    }
+    
+    // Вычисляем дополняющие веса до матрицы 16х16
+    u_y_2 = 16 - u_y_1;
+    u_x_2 = 16 - u_x_1;
 
-    // Читаем 4 соседние ячейки сжатой макроструктуры 8х8 из t1 (macroTexture)
-    // Используем .r (канал со средней яркостью GrayMid)
-    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
-    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
-    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
+    // 3. Выборка четырех опорных точек макрополя из сжатой текстуры t1 (буфер p3)
+    float k_S    = GetMacroGray(int2(tex_x + offset_LRTB.x,     tex_y + offset_LRTB.y));
+    float k_LR   = GetMacroGray(int2(tex_x + offset_LRTB.x + 1, tex_y + offset_LRTB.y));
+    float k_TB   = GetMacroGray(int2(tex_x + offset_LRTB.x,     tex_y + offset_LRTB.y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + offset_LRTB.x + 1, tex_y + offset_LRTB.y + 1));
 
-    // Двумерная билинейная интерполяция макрополя (точная логика CPU, но на ядрах GPU)
-    float k_SS = ((k_S  * (9 - i_x) + k_LR   * (7 - i_x)) * (9 - i_y) +
-                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+    // Двумерная интерполяция по оригинальной формуле:
+    // ush_1 = (uch_p2_1a*u_y_1 + uch_p2_4a*u_y_2)*u_x_1 + (uch_p2_2a*u_y_1 + uch_p2_3a*u_y_2)*u_x_2;
+    float k_SS = ((k_S  * u_y_1 + k_TB   * u_y_2) * u_x_1 +
+                  (k_LR * u_y_1 + k_LRTB * u_y_2) * u_x_2) / 256.0f;
 
-    // Ограничиваем диапазон и выводим чистый серый фон макроструктуры
+    // Нормализуем яркость в диапазон 0.0 - 1.0 для вывода на экран GPU
     float out_bg = saturate(k_SS);
     
     return float4(out_bg, out_bg, out_bg, 1.0f);
