@@ -214,9 +214,40 @@ float4 PS_Downsample2X(VS_OUTPUT input) : SV_Target
     return srcTexture.Sample(samplerState0, input.Tex);
 }
 
+// ========================================================================
+// АППАРАТНЫЙ РЕЖИМ 4: ВОССТАНОВЛЕНИЕ И РАСТЯЖЕНИЕ МАКРОСТРУКТУРЫ НА GPU
+// ========================================================================
 float4 PS_Stage2(VS_OUTPUT input) : SV_Target
 {
-    return srcTexture.Sample(samplerState0, input.Tex);
+    // Корректируем координаты с учетом аппаратного сдвига (как в Stage3)
+    float2 tex0_local = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
+    
+    // Рассчитываем базовые матричные индексы блоков
+    int tex_x_base = (int)round(width * tex0_local.x / 4.0f);
+    int tex_y_base = (int)round(height * tex0_local.y / 4.0f);
+    
+    int tex_x = tex_x_base / 2;
+    int tex_y = tex_y_base / 2;
+    
+    // Внутриблочные веса интерполяции (шаг сетки 4х4 внутри макроструктуры 8х8)
+    int i_x = (tex_x_base % 2) * 4; 
+    int i_y = (tex_y_base % 2) * 4;
+
+    // Читаем 4 соседние ячейки сжатой макроструктуры 8х8 из t1 (macroTexture)
+    // Используем .r (канал со средней яркостью GrayMid)
+    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
+    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
+    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
+    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
+
+    // Двумерная билинейная интерполяция макрополя (точная логика CPU, но на ядрах GPU)
+    float k_SS = ((k_S  * (9 - i_x) + k_LR   * (7 - i_x)) * (9 - i_y) +
+                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+
+    // Ограничиваем диапазон и выводим чистый серый фон макроструктуры
+    float out_bg = saturate(k_SS);
+    
+    return float4(out_bg, out_bg, out_bg, 1.0f);
 }
 
 float4 PS_PixelShaderStage2(VS_OUTPUT input) : SV_Target

@@ -438,46 +438,67 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 3: // Режим 4: Растянутый после сжатия (ПОЛНОСТЬЮ АВТОНОМНЫЙ ВЫВОД)
+        case 3: // Режим 4: Растянутый после сжатия (ВЫВОД СЛЕПКА GPU ЧЕРЕЗ БЫСТРЫЙ BITBLT)
         {
             if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                // В отличие от Режима 3, этот буфер полноразмерный (imgWidth x imgHeight)
-                UINT startX = (UINT)g_dlgScrollX;
-                UINT startY = (UINT)g_dlgScrollY;
-
+                int startX = g_dlgScrollX;
+                int startY = g_dlgScrollY;
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
                 int winW = rcClient.right - rcClient.left;
                 int winH = rcClient.bottom - rcClient.top;
                 if (winW <= 0 || winH <= 0) break;
 
+                // 1. Создаем временный контекст в памяти, совместимый с экраном панели
+                HDC hMemDC = CreateCompatibleDC(hdc);
+
+                // 2. Описываем структуру пикселей для создания совместимого холста (DIB) полноразмерного кадра
                 BITMAPINFO bmi = {};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
                 bmi.bmiHeader.biWidth = g_currentImgWidth;
-                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight; // Сверху вниз
+                // Отрицательная высота, так как слепок из GPU лежит в памяти сверху вниз (как в Режиме 3)
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight;
                 bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biBitCount = 32; // Честные 32 бита (DWORD на пиксель)
                 bmi.bmiHeader.biCompression = BI_RGB;
 
-                int viewW = ((startX + (UINT)winW) > g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
-                int viewH = ((startY + (UINT)winH) > g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
+                // 3. Создаем физический холст Windows HBITMAP на основе нашего массива пикселей
+                void* pBits = nullptr;
+                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                if (hBmp && pBits)
+                {
+                    // Копируем данные из нашего буфера ОЗУ (куда видеокарта сбросила слепок) прямо в память холста Windows
+                    memcpy(pBits, pStretchedBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
 
-                HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-                FillRect(hdc, &rcClient, hBg);
-                DeleteObject(hBg);
+                    // 4. Выбираем холст в созданный контекст памяти
+                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
-                // Стреляем сырым массивом pStretchedBuffer, не трогая контексты Режима 3
-                StretchDIBits(
-                    hdc,
-                    0, 0, viewW, viewH,
-                    (int)startX, (int)startY,
-                    viewW, viewH,
-                    pStretchedBuffer,
-                    &bmi,
-                    DIB_RGB_COLORS,
-                    SRCCOPY
-                );
+                    // Очищаем фон окна под обрезку кадра
+                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                    FillRect(hdc, &rcClient, hBg);
+                    DeleteObject(hBg);
+
+                    // 5. МГНОВЕННОЕ И БЫСТРОЕ КОПИРОВАНИЕ БИТ В БИТ
+                    // Вычисляем, сколько пикселей физически помещается в окно отладки
+                    int viewW = ((startX + winW) > (int)g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
+                    int viewH = ((startY + winH) > (int)g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
+
+                    BitBlt(
+                        hdc, // Куда рисуем (экран панели отладки)
+                        0, 0, // Левый верхний угол приемника
+                        viewW, viewH, // Размеры копируемого блока пикселей
+                        hMemDC, // Откуда берем (наш контекст с макроструктурой от GPU)
+                        startX, startY, // Координаты смещения ползунков в источнике (работают верно!)
+                        SRCCOPY // Флаг прямого попиксельного переноса памяти
+                    );
+
+                    // 6. Наводим порядок в системе: возвращаем старый объект и удаляем холст
+                    SelectObject(hMemDC, hOldBmp);
+                    DeleteObject(hBmp);
+                }
+                // Удаляем временный контекст памяти
+                DeleteDC(hMemDC);
             }
         }
         break;
