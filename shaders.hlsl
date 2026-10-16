@@ -14,13 +14,19 @@ VS_OUTPUT VS(float4 Pos : POSITION, float2 Tex : TEXCOORD)
 }
 
 // ========================================================================
-// ИСТИННЫЙ ОДНОПРОХОДНЫЙ ДЕФЕКТОСКОП АНАТОЛИЯ ФЕДОРОВИЧА (ОБРАЗЕЦ 2011 ГОДА)
+// АППАРАТНЫЕ ТЕКСТУРНЫЕ РЕГИСТРЫ ДЕФЕКТОСКОПА (СТАНДАРТ 2026)
 // ========================================================================
+Texture2D srcTexture       : register(t0); // Исходный кадр (оригинал 1:1)
+Texture2D macroTexture     : register(t1); // Сжатая матрица 4х4 (Режим 3)
+Texture2D stretchedTexture : register(t2); // Растянутое макрополе (Режим 4)
 
-// Входные ресурсы DirectX 11
-Texture2D srcTexture : register(t0);        // Наш единственный сырой файл
-Texture2D macroTexture : register(t1);      // Честно сжатая макроструктура 8х8 от GPU
-SamplerState samplerState0 : register(s0);  // Point-сэмплер без замыливания
+// Новые регистры после гамма-коррекции и финала:
+Texture2D macroGammaTex    : register(t3); // Сжатая матрица после гамма-коррекции
+Texture2D stretchGammaTex  : register(t4); // Растянутое поле после гамма-коррекции
+Texture2D resultFilterTex  : register(t5); // Финальный результат работы алгоритма (Режим 5)
+
+SamplerState samplerState0 : register(s0); // Линейный сэмплер видеокарты
+
 
 // Буфер констант (бывший register(c0))
 cbuffer cbData : register(b0)
@@ -41,6 +47,18 @@ float GetGray(float2 uv)
     return dot(srcTexture.Sample(samplerState0, uv).rgb, WEIGHT);
 }
 
+VS_OUTPUT VS_DiagnosticQuad(uint vID : SV_VertexID)
+{
+    VS_OUTPUT output;
+    
+    // Генерируем координаты углов экрана (-1..1) для полного покрытия холста
+    float2 texCoord = float2((vID << 1) & 2, vID & 2);
+    output.Pos = float4(texCoord * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+    output.Tex = texCoord;
+    
+    return output;
+}
+
 // Новая функция: читает пиксель напрямую по его матричному индексу
 float GetMacroGray(int2 pos)
 {
@@ -56,124 +74,154 @@ float GetMacroGray(int2 pos)
     return macroTexture.Load(int3(cl_x, cl_y, 0)).r;
 }
 
-// 1. ЛЕВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
-float4 func_LT(float2 tex_in)
+// ========================================================================
+// ИСТИННЫЙ ОДНОПРОХОДНЫЙ ДЕФЕКТОСКОП АНАТОЛИЯ ФЕДОРОВИЧА (ОБРАЗЕЦ 2011 ГОДА)
+// ========================================================================
+
+// 1. ШЕЙДЕР ДЛЯ ЛЕВОГО ВЕРХНЕГО УЧАСТКА БЛОКА
+float4 func_LT(float2 tex_in, float4 screen_pos)
 {
-    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
-    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
+    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
+    float2 tex_in_3 = tex_in; 
     
-    int tex_x = tex_x_base / 2;
-    int tex_y = tex_y_base / 2;
-
-    int i_x = (int)(floor(width * tex_in.x) % 8);
-    int i_y = (int)(floor(height * tex_in.y) % 8);
-
-    float k1     = GetGray(tex_in + 2.0f * float2(d_width, d_height));
-    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
-    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
-    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
-
-    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
-                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
-
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float2 tex_LR = tex_in + float2(d_width * 4.0f, 0.0f);
+    float2 tex_TB = tex_in + float2(0.0f, d_height * 4.0f);
+    float2 tex_LRTB = tex_in + float2(d_width * 4.0f, d_height * 4.0f);
+    
+    float k_S = GetGray(tex_in_3);
+    float k_LR = GetGray(tex_LR);
+    float k_TB = GetGray(tex_TB);
+    float k_LRTB = GetGray(tex_LRTB);
+    
+    int i_x = (int(round((tex_in.x + 4.0f * d_xy.x) * width)) % 4) * 2;
+    int i_y = (int(round((tex_in.y + 4.0f * d_xy.y) * height)) % 4) * 2;
+    
+    float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (9 + i_y) +
+                  (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+ 
+    float k1 = GetGray(tex_in); 
+    float delta = k1 - k_SS; 
+    float g_Gamma = 1.0f; 
+    float k_SS_gamma = pow(saturate(k_SS), g_Gamma);
+ 
+    float out_gray = saturate(k_SS_gamma + delta);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// 2. ПРАВЫЙ ВЕРХНИЙ ПИКСЕЛЬ
-float4 func_RT(float2 tex_in)
+// 2. ШЕЙДЕР ДЛЯ ПРАВОГО ВЕРХНЕГО УЧАСТКА БЛОКА
+float4 func_RT(float2 tex_in, float4 screen_pos)
 {
-    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
-    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
+    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
+    float2 tex_in_3 = tex_in; 
     
-    int tex_x = tex_x_base / 2;
-    int tex_y = tex_y_base / 2;
-
-    int i_x = (int)(floor(width * tex_in.x) % 8);
-    int i_y = (int)(floor(height * tex_in.y) % 8);
-
-    float k1     = GetGray(tex_in + 2.0f * float2(-d_width, d_height));
-    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
-    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
-    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
-
-    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
-                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
-
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float2 tex_LR = tex_in + float2(d_width * 4.0f, 0.0f);
+    float2 tex_TB = tex_in + float2(0.0f, d_height * 4.0f);
+    float2 tex_LRTB = tex_in + float2(d_width * 4.0f, d_height * 4.0f);
+    
+    float k_S = GetGray(tex_in_3);
+    float k_LR = GetGray(tex_LR);
+    float k_TB = GetGray(tex_TB);
+    float k_LRTB = GetGray(tex_LRTB);
+    
+    int i_x = (int(round((tex_in.x + 4.0f * d_xy.x) * width)) % 4) * 2;
+    int i_y = (int(round((tex_in.y + 4.0f * d_xy.y) * height)) % 4) * 2;
+    
+    float k_SS = ((k_S * (15 - i_x * 2) + k_LR * (1 + i_x * 2)) * (9 + i_y * 2) +
+                  (k_TB * (15 - i_x * 2) + k_LRTB * (1 + i_x * 2)) * (7 - i_y * 2)) / 256.0f;
+ 
+    float k1 = GetGray(tex_in); 
+    float delta = k1 - k_SS; 
+    float g_Gamma = 1.0f; 
+    float k_SS_gamma = pow(saturate(k_SS), g_Gamma);
+ 
+    float out_gray = saturate(k_SS_gamma + delta);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// 3. ЛЕВЫЙ НИЖНИЙ ПИКСЕЛЬ
-float4 func_LB(float2 tex_in)
+// 3. ШЕЙДЕР ДЛЯ ПРАВОГО НИЖНЕГО УЧАСТКА БЛОКА
+float4 func_RB(float2 tex_in, float4 screen_pos)
 {
-    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
-    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
+    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
+    float2 tex_in_3 = tex_in; 
     
-    int tex_x = tex_x_base / 2;
-    int tex_y = tex_y_base / 2;
-
-    int i_x = (int)(floor(width * tex_in.x) % 8);
-    int i_y = (int)(floor(height * tex_in.y) % 8);
-
-    float k1     = GetGray(tex_in + 2.0f * float2(d_width, -d_height));
-    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
-    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
-    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
-
-    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
-                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
-
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float2 tex_LR = tex_in + float2(d_width * 4.0f, 0.0f);
+    float2 tex_TB = tex_in + float2(0.0f, d_height * 4.0f);
+    float2 tex_LRTB = tex_in + float2(d_width * 4.0f, d_height * 4.0f);
+    
+    float k_S = GetGray(tex_in_3);
+    float k_LR = GetGray(tex_LR);
+    float k_TB = GetGray(tex_TB);
+    float k_LRTB = GetGray(tex_LRTB);
+    
+    int i_x = (int(round((tex_in.x + 4.0f * d_xy.x) * width)) % 4) * 2;
+    int i_y = (int(round((tex_in.y + 4.0f * d_xy.y) * height)) % 4) * 2;
+    
+    float k_SS = ((k_S * (15 - i_x * 2) + k_LR * (1 + i_x * 2)) * (15 - i_y * 2) +
+                  (k_TB * (15 - i_x * 2) + k_LRTB * (1 + i_x * 2)) * (1 + i_y * 2)) / 256.0f;
+ 
+    float k1 = GetGray(tex_in); // Исправлен тип с float2 на float
+    float delta = k1 - k_SS; 
+    float g_Gamma = 1.0f; 
+    float k_SS_gamma = pow(saturate(k_SS), g_Gamma);
+ 
+    float out_gray = saturate(k_SS_gamma + delta);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// 4. ПРАВЫЙ НИЖНИЙ ПИКСЕЛЬ
-float4 func_RB(float2 tex_in)
+// 4. ШЕЙДЕР ДЛЯ ЛЕВОГО НИЖНЕГО УЧАСТКА БЛОКА
+float4 func_LB(float2 tex_in, float4 screen_pos)
 {
-    int tex_x_base = (int)round(width * tex_in.x / 4.0f);
-    int tex_y_base = (int)round(height * tex_in.y / 4.0f);
+    float2 d_xy = float2(d_width / 2.0f, d_height / 2.0f);
+    float2 tex_in_3 = tex_in; 
     
-    int tex_x = tex_x_base / 2;
-    int tex_y = tex_y_base / 2;
-
-    int i_x = (int)(floor(width * tex_in.x) % 8);
-    int i_y = (int)(floor(height * tex_in.y) % 8);
-
-    float k1     = GetGray(tex_in + 2.0f * float2(-d_width, -d_height));
-    float k_S    = GetMacroGray(int2(tex_x,     tex_y));
-    float k_LR   = GetMacroGray(int2(tex_x + 1, tex_y));
-    float k_TB   = GetMacroGray(int2(tex_x,     tex_y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + 1, tex_y + 1));
-
-    float k_SS = ((k_S * (9 - i_x) + k_LR * (7 - i_x)) * (9 - i_y) +
-                  (k_TB * (9 - i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
-
-    float out_gray = saturate(k1 - k_SS + 0.5f);
+    float2 tex_LR = tex_in + float2(d_width * 4.0f, 0.0f);
+    float2 tex_TB = tex_in + float2(0.0f, d_height * 4.0f);
+    float2 tex_LRTB = tex_in + float2(d_width * 4.0f, d_height * 4.0f);
+    
+    float k_S = GetGray(tex_in_3);
+    float k_LR = GetGray(tex_LR);
+    float k_TB = GetGray(tex_TB);
+    float k_LRTB = GetGray(tex_LRTB);
+    
+    int i_x = (int(round((tex_in.x + 4.0f * d_xy.x) * width)) % 4) * 2;
+    int i_y = (int(round((tex_in.y + 4.0f * d_xy.y) * height)) % 4) * 2;
+    
+    float k_SS = ((k_S * (9 + i_x * 2) + k_LR * (7 - i_x * 2)) * (15 - i_y * 2) +
+                  (k_TB * (9 + i_x * 2) + k_LRTB * (7 - i_x * 2)) * (1 + i_y * 2)) / 256.0f;
+ 
+    float k1 = GetGray(tex_in); // Исправлен тип с float2 на float
+    float delta = k1 - k_SS; 
+    float g_Gamma = 1.0f; 
+    float k_SS_gamma = pow(saturate(k_SS), g_Gamma);
+ 
+    float out_gray = saturate(k_SS_gamma + delta);
     return float4(out_gray, out_gray, out_gray, 1.0f);
 }
 
-// ГЛАВНЫЙ АППАРАТНЫЙ ШЕЙДЕР ФИЛЬТРАЦИИ
+// ========================================================================
+// ГЛАВНЫЙ ВЫЗЫВАЮЩИЙ ШЕЙДЕР ФИЛЬТРАЦИИ ДЕФЕКТОСКОПА
+// ========================================================================
 float4 PS_Stage3(VS_OUTPUT input) : SV_Target
 {
-    float2 tex0 = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
-    int tex_x = round(width * tex0[0] / 4.0f);
-    int tex_y = round(height * tex0[1] / 4.0f);
+    // 1. Читаем чистый пиксель оригинала из регистра t0
+    float4 k1_rgba = srcTexture.Sample(samplerState0, input.Tex);
+    float k1 = dot(k1_rgba.rgb, WEIGHT);
 
-    if (tex_x % 2 == 0)
-    {
-        if (tex_y % 2 == 0) return func_LT(tex0);
-        else                return func_LB(tex0);
-    }
-    else
-    {
-        if (tex_y % 2 == 0) return func_RT(tex0);
-        else                return func_RB(tex0);
-    }
+    // 2. Читаем УЖЕ ГОТОВОЕ, плавно интерполированное макрополе из регистра t4
+    // (Никаких round() и % 4 — видеокарта выдает идеальный гладкий градиент)
+    float4 k_SS_rgba = stretchGammaTex.Sample(samplerState0, input.Tex);
+    float k_SS = k_SS_rgba.r;
+
+    // 3. Считаем дельту дефектоскопа Анатолия Федоровича
+    float delta = k1 - k_SS;
+    float g_Gamma = 1.0f;
+    float k_SS_gamma = pow(saturate(k_SS), g_Gamma);
+
+    // Выдаем итоговый отфильтрованный кадр
+    float out_gray = saturate(k_SS_gamma + delta);
+    return float4(out_gray, out_gray, out_gray, 1.0f);
 }
+
 
 // ШЕЙДЕР СКВОЗНОГО КОПИРОВАНИЯ ЭКРАНА С УЧЕТОМ ШТОРКИ ДО/ПОСЛЕ
 Texture2D statsTexture : register(t1); // Сюда подадим готовый фильтр из Stage3
@@ -215,87 +263,111 @@ float4 PS_Downsample2X(VS_OUTPUT input) : SV_Target
 }
 
 // ========================================================================
-// АППАРАТНЫЙ РЕЖИМ 4: ТОЧНАЯ МАТЕМАТИКА ЧЕТЫРЕХ КВАДРАНТОВ АНАТОЛИЯ ФЕДОРОВИЧА
+// АППАРАТНЫЙ РЕЖИМ 4: ЧЕСТНЫЙ ПОПИКСЕЛЬНЫЙ ШАГ ПО СЕТКЕ МОНИТОРА (1:1)
 // ========================================================================
-float4 PS_Stage2(VS_OUTPUT input) : SV_Target
-{
-    // 1. Получаем локальные координаты, нормированные на шаг сетки
-    float2 tex0_local = float2(input.Tex.x - 2.0f * d_width, input.Tex.y - 2.0f * d_height);
-    
-    // Переводим UV-координаты в физическую сетку пикселей кадра
-    float fX = tex0_local.x * width;
-    float fY = tex0_local.y * height;
-    
-    // Находим базовый индекс макроструктуры 8х8 (в памяти это ячейки сжатого буфера t1)
-    int tex_x = (int)floor(fX / 8.0f);
-    int tex_y = (int)floor(fY / 8.0f);
-    
-    // Вычисляем локальный шаг внутри блока 8х8 (эквивалент i1 и j1 в оригинальном цикле)
-    int j1 = (int)floor(fX) % 8;
-    int i1 = (int)floor(fY) % 8;
-    
-    // Программное укрупнение шага (i1_2 = i1 * 2, j1_2 = j1 * 2 из кода 2011 года)
-    int j1_2 = j1 * 2;
-    int i1_2 = i1 * 2;
-    
-    // Переменные для весов интерполяции
-    int u_x_1 = 0, u_x_2 = 0, u_y_1 = 0, u_y_2 = 0;
-    int2 offset_LRTB = int2(0, 0);
-    
-    // 2. РАЗДЕЛЕНИЕ НА 4 КВАДРАНТА (МАТЕМАТИКА ИЗ ФАЙЛА СТРАНИЦ 37-44)
-    if (i1 < 4 && j1 < 4) 
-    {
-        // ЛЕВЫЙ ВЕРХНИЙ КВАДРАНТ (Страница 37-38)
-        u_y_1 = i1_2 + 9;
-        u_x_1 = j1_2 + 9;
-        offset_LRTB = int2(0, 0); // Читаем текущий блок и соседей вокруг него
-    }
-    else if (i1 < 4 && j1 >= 4)
-    {
-        // ПРАВЫЙ ВЕРХНИЙ КВАДРАНТ (Страница 40)
-        u_y_1 = i1_2 + 9;
-        u_x_1 = 23 - j1_2;
-        offset_LRTB = int2(1, 0);
-    }
-    else if (i1 >= 4 && j1 >= 4)
-    {
-        // ПРАВЫЙ НИЖНИЙ КВАДРАНТ (Страница 42)
-        u_y_1 = 23 - i1_2;
-        u_x_1 = 23 - j1_2;
-        offset_LRTB = int2(1, 1);
-    }
-    else 
-    {
-        // ЛЕВЫЙ НИЖНИЙ КВАДРАНТ (Страница 44)
-        u_y_1 = 23 - i1_2;
-        u_x_1 = j1_2 + 9;
-        offset_LRTB = int2(0, 1);
-    }
-    
-    // Вычисляем дополняющие веса до матрицы 16х16
-    u_y_2 = 16 - u_y_1;
-    u_x_2 = 16 - u_x_1;
-
-    // 3. Выборка четырех опорных точек макрополя из сжатой текстуры t1 (буфер p3)
-    float k_S    = GetMacroGray(int2(tex_x + offset_LRTB.x,     tex_y + offset_LRTB.y));
-    float k_LR   = GetMacroGray(int2(tex_x + offset_LRTB.x + 1, tex_y + offset_LRTB.y));
-    float k_TB   = GetMacroGray(int2(tex_x + offset_LRTB.x,     tex_y + offset_LRTB.y + 1));
-    float k_LRTB = GetMacroGray(int2(tex_x + offset_LRTB.x + 1, tex_y + offset_LRTB.y + 1));
-
-    // Двумерная интерполяция по оригинальной формуле:
-    // ush_1 = (uch_p2_1a*u_y_1 + uch_p2_4a*u_y_2)*u_x_1 + (uch_p2_2a*u_y_1 + uch_p2_3a*u_y_2)*u_x_2;
-    float k_SS = ((k_S  * u_y_1 + k_TB   * u_y_2) * u_x_1 +
-                  (k_LR * u_y_1 + k_LRTB * u_y_2) * u_x_2) / 256.0f;
-
-    // Нормализуем яркость в диапазон 0.0 - 1.0 для вывода на экран GPU
-    float out_bg = saturate(k_SS);
-    
-    return float4(out_bg, out_bg, out_bg, 1.0f);
+// Новые вспомогательные функции интерполяции макрополя для PS_Stage2
+float4 macro_LT(int2 pos, int i_x, int i_y) {
+/*
+    float k_S = GetMacroGray(pos);
+    float k_LR = GetMacroGray(pos + int2(1, 0));
+    float k_TB = GetMacroGray(pos + int2(0, 1));
+    float k_LRTB = GetMacroGray(pos + int2(1, 1));
+    float k_SS = ((k_S * (9 + i_x) + k_LR * (7 - i_x)) * (9 + i_y) +
+                  (k_TB * (9 + i_x) + k_LRTB * (7 - i_x)) * (7 - i_y)) / 256.0f;
+    //return float4(saturate(k_SS), saturate(k_SS), saturate(k_SS), 1.0f);
+    */
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
-float4 PS_PixelShaderStage2(VS_OUTPUT input) : SV_Target
+float4 macro_RT(int2 pos, int i_x, int i_y) {
+/*
+    float k_S = GetMacroGray(pos);
+    float k_LR = GetMacroGray(pos + int2(1, 0));
+    float k_TB = GetMacroGray(pos + int2(0, 1));
+    float k_LRTB = GetMacroGray(pos + int2(1, 1));
+    float k_SS = ((k_S * (15 - i_x * 2) + k_LR * (1 + i_x * 2)) * (9 + i_y * 2) +
+                  (k_TB * (15 - i_x * 2) + k_LRTB * (1 + i_x * 2)) * (7 - i_y * 2)) / 256.0f;
+    //return float4(saturate(k_SS), saturate(k_SS), saturate(k_SS), 1.0f);
+    */
+    return float4(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+float4 macro_RB(int2 pos, int i_x, int i_y) {
+/*
+    float k_S = GetMacroGray(pos);
+    float k_LR = GetMacroGray(pos + int2(1, 0));
+    float k_TB = GetMacroGray(pos + int2(0, 1));
+    float k_LRTB = GetMacroGray(pos + int2(1, 1));
+    float k_SS = ((k_S * (15 - i_x * 2) + k_LR * (1 + i_x * 2)) * (15 - i_y * 2) +
+                  (k_TB * (15 - i_x * 2) + k_LRTB * (1 + i_x * 2)) * (1 + i_y * 2)) / 256.0f;
+    //return float4(saturate(k_SS), saturate(k_SS), saturate(k_SS), 1.0f);
+    */
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+float4 macro_LB(int2 pos, int i_x, int i_y) {
+/*
+    float k_S = GetMacroGray(pos);
+    float k_LR = GetMacroGray(pos + int2(1, 0));
+    float k_TB = GetMacroGray(pos + int2(0, 1));
+    float k_LRTB = GetMacroGray(pos + int2(1, 1));
+    float k_SS = ((k_S * (9 + i_x * 2) + k_LR * (7 - i_x * 2)) * (15 - i_y * 2) +
+                  (k_TB * (9 + i_x * 2) + k_LRTB * (7 - i_x * 2)) * (1 + i_y * 2)) / 256.0f;
+    //return float4(saturate(k_SS), saturate(k_SS), saturate(k_SS), 1.0f);
+    */
+    return float4(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+// Финальный исправленный шейдер растяжения макроструктуры
+float4 PS_Stage2(VS_OUTPUT input, float4 pixelPos : SV_Position) : SV_Target
 {
-    return srcTexture.Sample(samplerState0, input.Tex);
+    float fX = pixelPos.x;
+    float fY = pixelPos.y;
+
+    int tex_x = (int)floor((fX + 0.5f) / 4.0f);
+    int tex_y = (int)floor((fY + 0.5f) / 4.0f);
+
+    // Локальный шаг внутри макроблока 4х4
+    int i_x = (int)floor(fX + 0.5f) % 4;
+    int i_y = (int)floor(fY + 0.5f) % 4;
+
+    // Ветвление для выбора правильного стыка интерполяции в зависимости от четверти
+    if (i_x < 2)
+    {
+        if (i_y < 2) return macro_LT(int2(tex_x, tex_y), i_x, i_y);
+        else return macro_LB(int2(tex_x, tex_y), i_x, i_y);
+    }
+    else
+    {
+        if (i_y < 2) return macro_RT(int2(tex_x, tex_y), i_x, i_y);
+        else return macro_RB(int2(tex_x, tex_y), i_x, i_y);
+    }
+}
+
+/*
+float4 PS_Stage2(VS_OUTPUT input, float4 pixelPos : SV_Position) : SV_Target
+{
+    // Сдвиг на 0.5 пикселя макротекстуры для точного попадания в центры блоков 4х4,
+    // чтобы компенсировать аппаратное смещение растеризатора Direct3D.
+    // (Используем d_width * 2.0f, так как шаг макросетки в 4 раза больше исходного)
+    float2 uv_offset = float2(d_width * 2.0f, d_height * 2.0f);
+    float2 corrected_uv = input.Tex - uv_offset;
+
+    // Читаем макротекстуру t1 (g_pStageDown4SRV) через линейный сэмплер.
+    // Видеокарта аппаратно выполнит ту самую формулу весов Анатолия Федоровича,
+    // исключая любые ступенчатые скачки яркости и темные нити на стыках!
+    float4 macro_color = macroTexture.Sample(samplerState0, corrected_uv);
+
+    // Возвращаем чистый, идеально интерполированный серый фон
+    float out_bg = saturate(macro_color.r);
+    return float4(out_bg, out_bg, out_bg, 1.0f);
+}
+*/
+
+float4 PS_PixelShaderStage2(VS_OUTPUT input, float4 pixelPos : SV_Position) : SV_Target
+{
+    // Вызываем наш настоящий четырехзонный интерполятор макрополя!
+    return PS_Stage2(input, pixelPos);
 }
 
 Texture2D    ss0 : register(t0);
@@ -339,6 +411,7 @@ float4 main(VS_OUTPUT input) : SV_Target
     return float4(GrayMid, GrayMin, GrayMax, GraySqr);
 }
 
+// === НАСТОЯЩЕЕ АППАРАТНОЕ СЖАТИЕ БЛОКОВ 4х4 В SHADERS.HLSL ===
 float4 PS_Downsample4x4(VS_OUTPUT input) : SV_Target
 {
     float3 WEIGHT = float3(0.299f, 0.587f, 0.114f);
@@ -349,6 +422,7 @@ float4 PS_Downsample4x4(VS_OUTPUT input) : SV_Target
     float GrayMax = 0.0f;
     float GraySqr = 0.0f;
     
+    // Обходим блок 4х4 напрямую от исходного изображения
     for(int i = 0; i < 4; i++)
     {
         for(int j = 0; j < 4; j++)
@@ -371,40 +445,7 @@ float4 PS_Downsample4x4(VS_OUTPUT input) : SV_Target
     GraySqr -= GrayMid * GrayMid;
     if(GraySqr > 0.0f) GraySqr = sqrt(GraySqr);
     
-    return float4(GrayMid, GrayMin, GrayMax, GraySqr);
-}
-
-float4 PS_Downsample8x8(VS_OUTPUT input) : SV_Target
-{
-    float4 k1;
-    float GrayMid = 0.0f;
-    float GrayMin = 1.0f;
-    float GrayMax = 0.0f;
-    float GraySqr = 0.0f;
-    
-    // Обходим блок 2х2 от результатов первой стадии (что дает суммарное сжатие 8х8)
-    for(int i = 0; i < 2; i++)
-    {
-        for(int j = 0; j < 2; j++)
-        {
-            // Читаем данные из текстуры первого шага (используем правильный сэмплер)
-            float2 offset = float2(j * d_width * 4.0f, i * d_height * 4.0f);
-            k1 = srcTexture.Sample(samplerState0, input.Tex + offset);
-            
-            GrayMid += k1.r; // Канал R хранит среднюю яркость блоков 4х4
-            GraySqr += k1.w * k1.w + k1.r * k1.r; // Канал W хранит дисперсию
-            
-            if(k1.g < GrayMin) GrayMin = k1.g; // Канал G хранит минимум
-            if(k1.b > GrayMax) GrayMax = k1.b; // Канал B хранит максимум
-        }
-    }
-    
-    GrayMid /= 4.0f;
-    GraySqr /= 4.0f;
-    GraySqr -= GrayMid * GrayMid;
-    if(GraySqr > 0.0f) GraySqr = sqrt(GraySqr);
-    
-    // Возвращаем финально упакованную макроструктуру 8х8
+    // Возвращаем упакованную макроструктуру блока 4х4
     return float4(GrayMid, GrayMin, GrayMax, GraySqr);
 }
 

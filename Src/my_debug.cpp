@@ -19,14 +19,14 @@ ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточ�
 
 UINT* pPixelsBuffer = NULL;                             // Наш глобальный исходный массив кадра
 UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!
-UINT* pCompressedBuffer8x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
+UINT* pCompressedBuffer4x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
 UINT* pStretchedBuffer = NULL;                          // Буфер для хранения кадра, растянутого обратно после сжатия
 
 // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
 int                     g_dlgScrollX = 0; // Сдвиг по горизонтали для окна диагностики
 int                     g_dlgScrollY = 0; // Сдвиг по вертикали для окна диагностики
-int                     g_dlgScrollX_8x8 = 0; // Сдвиг по горизонтали для окна диагностики
-int                     g_dlgScrollY_8x8 = 0; // Сдвиг по вертикали для окна диагностики
+int                     g_dlgScrollX_4x4 = 0; // Сдвиг по горизонтали для окна диагностики
+int                     g_dlgScrollY_4x4 = 0; // Сдвиг по вертикали для окна диагностики
 extern UINT             g_currentImgWidth;  // Храним размеры текущего файла
 extern UINT             g_currentImgHeight;
 
@@ -60,14 +60,14 @@ void UpdateDlgScrollbars(HWND hWnd)
 
         si.nPage = winW;
         si.nMax = compressedW;
-        if (g_dlgScrollX_8x8 > (si.nMax - (int)si.nPage)) g_dlgScrollX_8x8 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
-        si.nPos = g_dlgScrollX_8x8;
+        if (g_dlgScrollX_4x4 > (si.nMax - (int)si.nPage)) g_dlgScrollX_4x4 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
+        si.nPos = g_dlgScrollX_4x4;
         SetScrollInfo(hWnd, SB_HORZ, &si, TRUE);
 
         si.nPage = winH; // Размер вертикальной страницы равен физической высоте окна winH
         si.nMax = compressedH;
-        if (g_dlgScrollY_8x8 > (si.nMax - (int)si.nPage)) g_dlgScrollY_8x8 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
-        si.nPos = g_dlgScrollY_8x8;
+        if (g_dlgScrollY_4x4 > (si.nMax - (int)si.nPage)) g_dlgScrollY_4x4 = (si.nMax > (int)si.nPage) ? (si.nMax - (int)si.nPage) : 0;
+        si.nPos = g_dlgScrollY_4x4;
         SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
     }
     else // Для Режимов 1 и 2 (Исходный и Монохромный)
@@ -94,7 +94,7 @@ void UpdateDiagnosticStatusText(HWND hWnd)
     if (g_diagMode == 2) // Режим 3: Сжатый в 8 раз
     {
         wsprintf(statusBuf, L"Сжатый режим 8х8 | Позиция X: %d, Y: %d",
-            g_dlgScrollX_8x8, g_dlgScrollY_8x8);
+            g_dlgScrollX_4x4, g_dlgScrollY_4x4);
     }
     else // Режимы 1 и 2: Исходный и Монохромный
     {
@@ -147,7 +147,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         {
             // ИСПРАВЛЕНИЕ: строго записываем чистую позицию без каких-либо искажений масштаба
             if (g_diagMode == 2) {
-                g_dlgScrollX_8x8 = si.nPos;
+                g_dlgScrollX_4x4 = si.nPos;
             }
             else {
                 g_dlgScrollX = si.nPos; // Чистый сдвиг 1:1 для Режимов 1 и 2   
@@ -195,7 +195,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         if (si.nPos != oldPos)
         {
             if (g_diagMode == 2) {
-                g_dlgScrollY_8x8 = si.nPos; // Строго для Режима 3 (case 2) пишем в сжатую координату
+                g_dlgScrollY_4x4 = si.nPos; // Строго для Режима 3 (case 2) пишем в сжатую координату
             }
             else {
                 g_dlgScrollY = si.nPos;     // Для Режимов 1 и 2 (case 0 и case 1) пишем в обычную координату
@@ -241,10 +241,10 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
             wchar_t titleBuf[128];
             // Выводим физические размеры сжатых буферов прямо в заголовок для диагностики
-            wsprintf(titleBuf, L"Режим %d | Буфер 4х4: %dx%d | Буфер 8х8: %dx%d",
-                g_diagMode + 1,
-                g_currentImgWidth / 4, g_currentImgHeight / 4,
-                g_currentImgWidth / 8, g_currentImgHeight / 8);
+            wsprintf(titleBuf, L"Режим %d | Буфер 4х4: %dx%d", 
+                g_diagMode + 1, 
+                g_currentImgWidth / 4, 
+                g_currentImgHeight / 4);
 
             SetWindowText(hWnd, titleBuf);
             UpdateDlgScrollbars(hWnd); // Перестраиваем диапазоны ползунков под выбранный режим кадра
@@ -372,12 +372,12 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         break;
         case 2: // Режим 3: Сжатый в 8 раз (ВЫВОД ЧЕРЕЗ БЫСТРЫЙ BITBLT)
         {
-            if (pCompressedBuffer8x != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            if (pCompressedBuffer4x != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
                 UINT compressedW = g_currentImgWidth / 8;
                 UINT compressedH = g_currentImgHeight / 8;
-                int startX = g_dlgScrollX_8x8;
-                int startY = g_dlgScrollY_8x8;
+                int startX = g_dlgScrollX_4x4;
+                int startY = g_dlgScrollY_4x4;
 
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
@@ -403,7 +403,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 if (hBmp && pBits)
                 {
                     // Копируем данные из нашего буфера ОЗУ прямо в память холста Windows
-                    memcpy(pBits, pCompressedBuffer8x, compressedW * compressedH * sizeof(UINT));
+                    memcpy(pBits, pCompressedBuffer4x, compressedW * compressedH * sizeof(UINT));
 
                     // 4. Выбираем холст в созданный контекст памяти
                     HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
@@ -438,70 +438,58 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 3: // Режим 4: Растянутый после сжатия (ВЫВОД СЛЕПКА GPU ЧЕРЕЗ БЫСТРЫЙ BITBLT)
+        case 3: // Режим 4: Растянутый после сжатия (ВЫВОД ИЗ ЧЕСТНОГО ПОЛНОРАЗМЕРНОГО МАССИВА)
         {
             if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
+                // Берем координаты из обычных ползунков 1:1, а не из сжатых 8х8!
                 int startX = g_dlgScrollX;
                 int startY = g_dlgScrollY;
+
                 RECT rcClient;
                 GetClientRect(hWnd, &rcClient);
                 int winW = rcClient.right - rcClient.left;
                 int winH = rcClient.bottom - rcClient.top;
                 if (winW <= 0 || winH <= 0) break;
 
-                // 1. Создаем временный контекст в памяти, совместимый с экраном панели
                 HDC hMemDC = CreateCompatibleDC(hdc);
 
-                // 2. Описываем структуру пикселей для создания совместимого холста (DIB) полноразмерного кадра
                 BITMAPINFO bmi = {};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                bmi.bmiHeader.biWidth = g_currentImgWidth;
-                // Отрицательная высота, так как слепок из GPU лежит в памяти сверху вниз (как в Режиме 3)
-                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight;
+                // === ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНО ЗАДАЕМ ПОЛНЫЙ ИСХОДНЫЙ РАЗМЕР КАДРА ===
+                bmi.bmiHeader.biWidth = g_currentImgWidth;   // Строго полный размер (4128)
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight; // Строго полный размер (3096) с минусом
                 bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32; // Честные 32 бита (DWORD на пиксель)
+                bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = BI_RGB;
 
-                // 3. Создаем физический холст Windows HBITMAP на основе нашего массива пикселей
                 void* pBits = nullptr;
                 HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
                 if (hBmp && pBits)
                 {
-                    // Копируем данные из нашего буфера ОЗУ (куда видеокарта сбросила слепок) прямо в память холста Windows
+                    // Скоростное копирование памяти полноразмерного слепка
                     memcpy(pBits, pStretchedBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
 
-                    // 4. Выбираем холст в созданный контекст памяти
                     HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
-                    // Очищаем фон окна под обрезку кадра
                     HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
                     FillRect(hdc, &rcClient, hBg);
                     DeleteObject(hBg);
 
-                    // 5. МГНОВЕННОЕ И БЫСТРОЕ КОПИРОВАНИЕ БИТ В БИТ
-                    // Вычисляем, сколько пикселей физически помещается в окно отладки
                     int viewW = ((startX + winW) > (int)g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
                     int viewH = ((startY + winH) > (int)g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
 
-                    BitBlt(
-                        hdc, // Куда рисуем (экран панели отладки)
-                        0, 0, // Левый верхний угол приемника
-                        viewW, viewH, // Размеры копируемого блока пикселей
-                        hMemDC, // Откуда берем (наш контекст с макроструктурой от GPU)
-                        startX, startY, // Координаты смещения ползунков в источнике (работают верно!)
-                        SRCCOPY // Флаг прямого попиксельного переноса памяти
-                    );
+                    // Копируем бит-в-бит на экран диагностической панели
+                    BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
 
-                    // 6. Наводим порядок в системе: возвращаем старый объект и удаляем холст
                     SelectObject(hMemDC, hOldBmp);
                     DeleteObject(hBmp);
                 }
-                // Удаляем временный контекст памяти
                 DeleteDC(hMemDC);
             }
         }
         break;
+
 
         case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
             break;
@@ -555,7 +543,7 @@ void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd)
     {
         AppendMenu(hPopupMenu, MF_STRING, 2000, L"Режим 1: Исходный");
         AppendMenu(hPopupMenu, MF_STRING, 2001, L"Режим 2: Монохромный");
-        AppendMenu(hPopupMenu, MF_STRING, 2002, L"Режим 3: Сжатый в 8 раз");
+        AppendMenu(hPopupMenu, MF_STRING, 2002, L"Режим 3: Сжатый в 4 раза (4х4)");
         AppendMenu(hPopupMenu, MF_STRING, 2003, L"Режим 4: Растянутый после сжатия");
         AppendMenu(hPopupMenu, MF_STRING, 2004, L"Режим 5: Разница монохромного и растянутого");
         AppendMenu(hPopupMenu, MF_STRING, 2005, L"Режим 6: Сжатый и применена гамма-коррекция");

@@ -80,7 +80,8 @@ ID3D11Texture2D* g_pStage2Texture = nullptr;
 // === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
 ID3D11PixelShader* g_pPixelShaderDown = nullptr; // Шейдер сжатия 4х4
-ID3D11PixelShader* g_pPixelShaderDown2 = nullptr; // Шейдер сжатия 8х8
+ID3D11PixelShader* g_pPixelShaderDown4x4 = nullptr; // Шейдер сжатия 8х8
+ID3D11VertexShader* g_pDiagnosticVS = nullptr;
 
 // Стадия 1:2
 ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
@@ -89,10 +90,6 @@ ID3D11ShaderResourceView* g_pStageDown2SRV = NULL;
 // Стадия 1:4
 ID3D11RenderTargetView* g_pStageDown4RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown4SRV = NULL;
-
-// Стадия 1:8
-ID3D11RenderTargetView* g_pStageDown8RTV = NULL;
-ID3D11ShaderResourceView* g_pStageDown8SRV = NULL;
 
 // Стадия 1:16
 ID3D11RenderTargetView* g_pStageDown16RTV = NULL;
@@ -118,12 +115,13 @@ UINT g_compressedHeight = 0;
 bool g_bNeedCopyOriginal = true;    // Флаг для копии исходного цветного файла
 bool g_bNeedCopyStage3 = true;      // Флаг для монохромного кадра (Стадия 3)
 bool g_bNeedCopyCompressed = true;  // Флаг для макроструктуры 8х8 (Стадия 2)
+bool g_bNeedCopyStretched = true;  // НОВЫЙ уникальный флаг для Режима 4!
 
 // === ОБЪЯВЛЕНИЕ ВНЕШНИХ ПЕРЕМЕННЫХ ИЗ ПАНЕЛИ ДИАГНОСТИКИ ===
 extern UINT* pPixelsBuffer;
 extern UINT* pRawPixels;
 extern ID3D11Texture2D* g_pTextureStaging;
-extern UINT* pCompressedBuffer8x;   // Внешний буфер сжатия из my_debug.cpp
+extern UINT* pCompressedBuffer4x;   // Внешний буфер сжатия из my_debug.cpp
 extern UINT* pStretchedBuffer;      // Буфер для хранения кадра, растянутого обратно после сжатия
 
 #define my_DRBUG
@@ -339,7 +337,15 @@ HRESULT InitDevice(HWND hwnd)
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
-        // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 5-ГО ШЕЙДЕРА (STAGE 3) ===
+    ID3DBlob* pVSDiagBlob = NULL;
+    hr = CompileShaderFromFile(L"shaders.hlsl", "VS_DiagnosticQuad", "vs_4_0", &pVSDiagBlob);
+    if (SUCCEEDED(hr))
+    {
+        g_pd3dDevice->CreateVertexShader(pVSDiagBlob->GetBufferPointer(), pVSDiagBlob->GetBufferSize(), NULL, &g_pDiagnosticVS);
+        pVSDiagBlob->Release();
+    }
+
+    // === НОВЫЙ КОД: КОМПИЛЯЦИЯ И СОЗДАНИЕ 5-ГО ШЕЙДЕРА (STAGE 3) ===
     ID3DBlob* pPSStage3Blob = NULL;
     // Указываем точку входа "PS_Stage3" — строго как имя функции в файле shaders.hlsl
     hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Stage3", "ps_4_0", &pPSStage3Blob);
@@ -369,15 +375,15 @@ HRESULT InitDevice(HWND hwnd)
     ID3DBlob* pPSBlobDown8 = nullptr;
     ID3DBlob* pErrorBlobLocal8 = nullptr;
 
-    hr = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "PS_Downsample8x8", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pPSBlobDown8, &pErrorBlobLocal8);
+    hr = D3DCompileFromFile(L"shaders.hlsl", nullptr, nullptr, "PS_Downsample4x4", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pPSBlobDown8, &pErrorBlobLocal8);
     if (FAILED(hr))
     {
         if (pErrorBlobLocal8) pErrorBlobLocal8->Release();
-        MessageBox(hwnd, L"Не удалось скомпилировать шейдер PS_Downsample8x8!", L"Ошибка", MB_OK | MB_ICONERROR);
+        MessageBox(hwnd, L"Не удалось скомпилировать шейдер PS_Downsample4x4!", L"Ошибка", MB_OK | MB_ICONERROR);
         return hr;
     }
 
-    hr = g_pd3dDevice->CreatePixelShader(pPSBlobDown8->GetBufferPointer(), pPSBlobDown8->GetBufferSize(), nullptr, &g_pPixelShaderDown2);
+    hr = g_pd3dDevice->CreatePixelShader(pPSBlobDown8->GetBufferPointer(), pPSBlobDown8->GetBufferSize(), nullptr, &g_pPixelShaderDown4x4);
     pPSBlobDown8->Release();
     if (FAILED(hr))
     {
@@ -645,10 +651,9 @@ void Render()
         HRESULT hr_s1 = g_pd3dDevice->CreateTexture2D(&descS1, nullptr, &g_pStage1Texture);
         if (SUCCEEDED(hr_s1))
         {
-            // Создаем холст для рисования (RTV) на базе вашей чистой заготовки g_pStageDown4RTV
-            g_pd3dDevice->CreateRenderTargetView(g_pStage1Texture, nullptr, &g_pStageDown4RTV);
-            // Создаем ресурс для чтения в шейдерах (SRV) на базе заготовки g_pStageDown4SRV
-            g_pd3dDevice->CreateShaderResourceView(g_pStage1Texture, nullptr, &g_pStageDown4SRV);
+            // Привязываем текстуру Стадии 1 к её СОБСТВЕННЫМ уникальным указателям
+            g_pd3dDevice->CreateRenderTargetView(g_pStage1Texture, nullptr, &g_pStage1RTV);
+            g_pd3dDevice->CreateShaderResourceView(g_pStage1Texture, nullptr, &g_pStage1SRV);
         }
     }
 
@@ -661,9 +666,9 @@ void Render()
     vpStage1.MinDepth = 0.0f;
     vpStage1.MaxDepth = 1.0f;
 
-    // === ФИЗИЧЕСКОЕ СОЗДАНИЕ ХОЛСТА ДЛЯ СТАДИИ 2 (СЖАТИЕ 8х8) ===
-    UINT s2Width = (fileWidth / 8 > 0) ? fileWidth / 8 : 1;
-    UINT s2Height = (fileHeight / 8 > 0) ? fileHeight / 8 : 1;
+    // === ФИЗИЧЕСКОЕ СОЗДАНИЕ ХОЛСТА ДЛЯ СТАДИИ 2 (ИСПРАВЛЕНИЕ: ДЕЛАЕМ ПОЛНЫЙ РАЗМЕР) ===
+    UINT s2Width = fileWidth;   // СТАЛО: ПОЛНЫЙ РАЗМЕР (Вместо fileWidth / 8)
+    UINT s2Height = fileHeight; // СТАЛО: ПОЛНЫЙ РАЗМЕР (Вместо fileHeight / 8)
 
     if (g_pStage2Texture)
     {
@@ -671,8 +676,8 @@ void Render()
         g_pStage2Texture->GetDesc(&currentDesc2);
         if (currentDesc2.Width != s2Width || currentDesc2.Height != s2Height)
         {
-            if (g_pStageDown8SRV) { g_pStageDown8SRV->Release(); g_pStageDown8SRV = nullptr; }
-            if (g_pStageDown8RTV) { g_pStageDown8RTV->Release(); g_pStageDown8RTV = nullptr; }
+            if (g_pStageDown4SRV) { g_pStageDown4SRV->Release(); g_pStageDown4SRV = nullptr; }
+            if (g_pStageDown4RTV) { g_pStageDown4RTV->Release(); g_pStageDown4RTV = nullptr; }
             g_pStage2Texture->Release();
             g_pStage2Texture = nullptr;
         }
@@ -681,11 +686,11 @@ void Render()
     if (g_pStage2Texture == nullptr)
     {
         D3D11_TEXTURE2D_DESC descS2 = {};
-        descS2.Width = s2Width;
-        descS2.Height = s2Height;
+        descS2.Width = s2Width;   // Теперь сюда придет полный размер 4128
+        descS2.Height = s2Height; // Теперь сюда придет полный размер 3096
         descS2.MipLevels = 1;
         descS2.ArraySize = 1;
-        descS2.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        descS2.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // СТАЛО: Стандартный формат для BitBlt
         descS2.SampleDesc.Count = 1;
         descS2.SampleDesc.Quality = 0;
         descS2.Usage = D3D11_USAGE_DEFAULT;
@@ -696,8 +701,8 @@ void Render()
         HRESULT hr_s2 = g_pd3dDevice->CreateTexture2D(&descS2, nullptr, &g_pStage2Texture);
         if (SUCCEEDED(hr_s2))
         {
-            g_pd3dDevice->CreateRenderTargetView(g_pStage2Texture, nullptr, &g_pStageDown8RTV);
-            g_pd3dDevice->CreateShaderResourceView(g_pStage2Texture, nullptr, &g_pStageDown8SRV);
+            g_pd3dDevice->CreateRenderTargetView(g_pStage2Texture, nullptr, &g_pStage2RTV);
+            g_pd3dDevice->CreateShaderResourceView(g_pStage2Texture, nullptr, &g_pStage2SRV);
         }
     }
 
@@ -741,12 +746,15 @@ void Render()
     // ПАСС НУЛЕВОЙ: ЗАПУСК ПЕРВОГО ШАГА СЖАТИЯ (БЛОКИ 4х4 В КАНАЛЫ R, G, B, A)
     // ========================================================================
     float ClearColorS1[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pStageDown4RTV, ClearColorS1);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageDown4RTV, nullptr);
+    g_pImmediateContext->ClearRenderTargetView(g_pStage1RTV, ClearColorS1);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage1RTV, nullptr);
     g_pImmediateContext->RSSetViewports(1, &vpStage1);
     g_pImmediateContext->PSSetShader(g_pPixelShaderDown, nullptr, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
     g_pImmediateContext->Draw(4, 0);
+
+    // Жестко отвязываем холст Первой Стадии от записи, закрывая его
+    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
 
     // Разрываем связи после сжатия, подготавливая видеокарту к Пассу А
     ID3D11ShaderResourceView* nullSRV_S1[] = { nullptr };
@@ -757,10 +765,10 @@ void Render()
     // ПАСС ПЕРВЫЙ: ЗАПУСК ВТОРОГО ШАГА СЖАТИЯ (МАКРОСТРУКТУРА 8х8 НА БАЗЕ 4х4)
     // ========================================================================
     float ClearColorS2[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pStageDown8RTV, ClearColorS2);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageDown8RTV, nullptr);
+    g_pImmediateContext->ClearRenderTargetView(g_pStageDown4RTV, ClearColorS2);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStageDown4RTV, nullptr);
     g_pImmediateContext->RSSetViewports(1, &vpStage2);
-    g_pImmediateContext->PSSetShader(g_pPixelShaderDown2, nullptr, 0);
+    g_pImmediateContext->PSSetShader(g_pPixelShaderDown4x4, nullptr, 0);
 
     // Подаем на вход текстуру с результатами первого шага (4х4)
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStageDown4SRV);
@@ -770,16 +778,84 @@ void Render()
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV_S1);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
 
+    // ========================================================================
+    // ПАСС ВТОРОЙ: АППАРАТНОЕ РАСТЯЖЕНИЕ МАКРОСТРУКТУРЫ (64 РАЗНЫХ ПИКСЕЛЯ!)
+    // ========================================================================
+    float ClearColorStage2[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearColorStage2);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage2RTV, nullptr);
+    g_pImmediateContext->RSSetViewports(1, &vpStage2);
+
+    // === НАЧАЛО ИЗМЕНЕНИЯ ===
+     // Отключаем тест глубины и трафарета, чтобы пиксели заглушек гарантированно записались
+    g_pImmediateContext->OMSetDepthStencilState(nullptr, 0);
+    // Отключаем смешивание цветов (Blend State), переводим в режим обычной перезаписи
+    g_pImmediateContext->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+    // Включаем наш автономный генератор вершин для теста заглушек
+    g_pImmediateContext->VSSetShader(g_pDiagnosticVS, nullptr, 0);
+
+    g_pImmediateContext->PSSetShader(g_pPixelShaderStage2, nullptr, 0);
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage1SRV);
+    g_pImmediateContext->Draw(4, 0);
+
+    // ВАЖНО: Возвращаем базовый вершинный шейдер плеера на место, чтобы Пасс Ноль не ломался!
+    g_pImmediateContext->VSSetShader(g_pVertexShader, nullptr, 0);
+
+    // Жестко отвязываем холст записи, закрывая его перед скачиванием в CPU
+    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
+
+    // Чисто разрываем связи после растяжения
+    g_pImmediateContext->PSSetShaderResources(1, 1, nullSRV);
+    g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
+
     g_pImmediateContext->RSSetViewports(1, &vpS3);
 
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearColorBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV); // Единственный вход t0
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStageDown8SRV); // Новый вход t1 с макроструктурой
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);     // t0: Исходный оригинал кадра 1:1
+    g_pImmediateContext->PSSetShaderResources(4, 1, &g_pStage2SRV);      // t4: Растянутое плавное поле из Stage2
+
     g_pImmediateContext->Draw(4, 0);
 
     // Чисто разрываем связи Пасса А
+    // ========================================================================
+    // НОВЫЙ БЛОК: СКАЧИВАНИЕ ГОТОВОГО СЛЕПКА GPU ДЛЯ КОНТРОЛЯ В РЕЖИМЕ 4
+    // ========================================================================
+    if (g_bNeedCopyStretched && g_pStage2SRV)
+    {
+        ID3D11Resource* pResSource = NULL;
+        g_pStage2SRV->GetResource(&pResSource);
+
+        if (pResSource && g_pTextureStaging)
+        {
+            g_pImmediateContext->CopyResource(g_pTextureStaging, pResSource);
+
+            D3D11_MAPPED_SUBRESOURCE mappedResource;
+            HRESULT hr = g_pImmediateContext->Map(g_pTextureStaging, 0, D3D11_MAP_READ, 0, &mappedResource);
+            if (SUCCEEDED(hr))
+            {
+                UINT* pSrcPixels = (UINT*)mappedResource.pData;
+                UINT rowPitch = mappedResource.RowPitch / sizeof(UINT);
+
+                for (UINT y = 0; y < g_currentImgHeight; y++)
+                {
+                    UINT srcRowOffset = y * rowPitch;
+                    UINT dstRowOffset = y * g_currentImgWidth;
+
+                    for (UINT x = 0; x < g_currentImgWidth; x++)
+                    {
+                        pStretchedBuffer[dstRowOffset + x] = pSrcPixels[srcRowOffset + x];
+                    }
+                }
+                g_pImmediateContext->Unmap(g_pTextureStaging, 0);
+            }
+            pResSource->Release();
+        }
+        g_bNeedCopyStretched = false;
+    }
+
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
 
@@ -1228,8 +1304,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             UINT stage1Width = (imgWidth / 4 > 0) ? imgWidth / 4 : 1;
             UINT stage1Height = (imgHeight / 4 > 0) ? imgHeight / 4 : 1;
 
-            UINT stage2Width = (imgWidth / 8 > 0) ? imgWidth / 8 : 1;
-            UINT stage2Height = (imgHeight / 8 > 0) ? imgHeight / 8 : 1;
+            UINT stage2Width = imgWidth;
+            UINT stage2Height = imgHeight;
 
             // --- Создаем буфер Stage 1 (Меньше в 4 раза под блоки 4х4) ---
             D3D11_TEXTURE2D_DESC descS1 = {};
@@ -1249,14 +1325,15 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 pTexS1->Release();
             }
 
-            // --- Создаем буфер Stage 2 (Меньше в 8 раз под макроблоки 8х8) ---
+            // --- Создаем буфер Stage 2 (ИСПРАВЛЕНИЕ: ДЕЛАЕМ ПОЛНОРАЗМЕРНЫМ ПОД СЕТКУ 1:1) ---
             D3D11_TEXTURE2D_DESC descS2 = {};
-            descS2.Width = stage2Width;
-            descS2.Height = stage2Height;
+            descS2.Width = imgWidth;   // СТАЛО: ПОЛНЫЙ РАЗМЕР (ВМЕСТО stage2Width)
+            descS2.Height = imgHeight; // СТАЛО: ПОЛНЫЙ РАЗМЕР (ВМЕСТО stage2Height)
             descS2.MipLevels = 1;
             descS2.ArraySize = 1;
             descS2.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             descS2.SampleDesc.Count = 1;
+            descS2.SampleDesc.Quality = 0;
             descS2.Usage = D3D11_USAGE_DEFAULT;
             descS2.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
@@ -1266,6 +1343,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 g_pd3dDevice->CreateShaderResourceView(pTexS2, NULL, &g_pStage2SRV);
                 pTexS2->Release();
             }
+
 
             // --- Создаем буфер Stage 3 (ПОЛНОРАЗМЕРНЫЙ под гладкий финальный кадр) ---
             // --- ИСПРАВЛЕНИЕ: ПЕРЕВОДИМ STAGE 3 В НАСТОЯЩИЙ HDR-ФОРМАТ С ПЛАВАЮЩЕЙ ТОЧКОЙ ---
@@ -1364,12 +1442,12 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     g_srcImgWidth = imgWidth;
     g_srcImgHeight = imgHeight;
 
-    // Вычисляем новые размеры, кратные 8
-    g_compressedWidth = ((imgWidth + 7) / 8);
-    g_compressedHeight = ((imgHeight + 7) / 8);
+    // Вычисляем новые размеры, кратные 4
+    g_compressedWidth = ((imgWidth + 3) / 4);
+    g_compressedHeight = ((imgHeight + 3) / 4);
 
-    g_paddedImgWidth = g_compressedWidth * 8;
-    g_paddedImgHeight = g_compressedHeight * 8;
+    g_paddedImgWidth = g_compressedWidth * 4;
+    g_paddedImgHeight = g_compressedHeight * 4;
 
     // === ЗАПОЛНЕНИЕ ОТЛАДОЧНОГО МАССИВА ПРИ ОТКРЫТИИ ФАЙЛА ===
     if (g_currentImgWidth > 0 && g_currentImgHeight > 0)
@@ -1401,8 +1479,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
         UINT compH = imgHeight / 8;
 
         // 1. Безопасно перевыделяем память под сжатый буфер в ОЗУ
-        if (pCompressedBuffer8x != nullptr) { delete[] pCompressedBuffer8x; pCompressedBuffer8x = nullptr; }
-        pCompressedBuffer8x = new UINT[compW * compH];
+        if (pCompressedBuffer4x != nullptr) { delete[] pCompressedBuffer4x; pCompressedBuffer4x = nullptr; }
+        pCompressedBuffer4x = new UINT[compW * compH];
 
         float WEIGHT_R = 0.299f, WEIGHT_G = 0.587f, WEIGHT_B = 0.114f;
 
@@ -1446,13 +1524,14 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 if (GraySqr > 0.0f) GraySqr = sqrt(GraySqr);
 
                 BYTE finalGray = (BYTE)(GrayMid * 255.0f);
-                pCompressedBuffer8x[mY * compW + mX] = (finalGray << 16) | (finalGray << 8) | finalGray;
+                pCompressedBuffer4x[mY * compW + mX] = (finalGray << 16) | (finalGray << 8) | finalGray;
             }
         }
     }
 
+    /*
     // === ЭТАЛОННЫЙ РАСЧЕТ РАСТЯНУТОГО ФОНА ДЛЯ РЕЖИМА 4 ===
-    if (pRawPixels && pCompressedBuffer8x && ::pStretchedBuffer && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+    if (pRawPixels && pCompressedBuffer4x && ::pStretchedBuffer && g_currentImgWidth > 0 && g_currentImgHeight > 0)
     {
         UINT compW = g_currentImgWidth / 8;
         UINT compH = g_currentImgHeight / 8;
@@ -1478,7 +1557,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 auto GetBufferGray = [&](int bx, int by) -> float {
                     int cl_x = (bx < 0) ? 0 : ((bx >= (int)compW) ? (int)compW - 1 : bx);
                     int cl_y = (by < 0) ? 0 : ((by >= (int)compH) ? (int)compH - 1 : by);
-                    return (float)(pCompressedBuffer8x[cl_y * compW + cl_x] & 0xFF) / 255.0f;
+                    return (float)(pCompressedBuffer4x[cl_y * compW + cl_x] & 0xFF) / 255.0f;
                     };
 
                 float k_S = GetBufferGray(tex_x, tex_y);
@@ -1496,6 +1575,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             }
         }
     }
+    */
 
     // === ЗОЛОТОЕ ПРАВИЛО: ЧИСТО ЗАКРЫВАЕМ ВСЕ РЕСУРСЫ И ПАМЯТЬ БЕЗ УТЕЧЕК! ===
     delete[] pPixelsBuffer;
