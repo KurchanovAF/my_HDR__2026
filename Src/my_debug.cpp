@@ -15,7 +15,7 @@ ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL; // Цель отрисо�
 void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
 int                      g_diagMode = 1;                // Текущий режим панели: 1, 2, 3 или 4
 ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
-ID3D11Texture2D* g_pTextureStaging = NULL;              // Промежуточная текстура для оригинала кадра
+extern ID3D11Texture2D* g_pStagingCompressed;              // Промежуточная текстура для оригинала кадра
 
 UINT* pPixelsBuffer = NULL;                             // Наш глобальный исходный массив кадра
 UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!

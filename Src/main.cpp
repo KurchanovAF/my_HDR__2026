@@ -56,12 +56,12 @@ HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixe
 ID3D11Buffer* g_pConstantBuffer = NULL;
 
 // === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ СВЕРТКИ АНАЛИЗА БЛОКОВ 4х4 ===
-ID3D11RenderTargetView* g_pStage1RTV = NULL; // Холст для записи фиолетового анализа 3-го шейдера
-ID3D11ShaderResourceView* g_pStage1SRV = NULL; // Ссылка на этот анализ для следующего шейдера
+ID3D11RenderTargetView* g_pRTVCompressed = NULL; // Холст для записи фиолетового анализа 3-го шейдера
+ID3D11ShaderResourceView* g_pSRVCompressed = NULL; // Ссылка на этот анализ для следующего шейдера
 
 // === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ УКРУПНЕННОГО АНАЛИЗА МАКРОБЛОКОВ 8х8 ===
-ID3D11RenderTargetView* g_pStage2RTV = NULL; // Холст для записи макроанализа 4-го шейдера
-ID3D11ShaderResourceView* g_pStage2SRV = NULL; // Ссылка на макроанализ для последующих шейдеров
+ID3D11RenderTargetView* g_pRTVStretched = NULL; // Холст для записи макроанализа 4-го шейдера
+ID3D11ShaderResourceView* g_pSRVStretched = NULL; // Ссылка на макроанализ для последующих шейдеров
 
 // ОБЪЕКТЫ ДЛЯ ФИЛЬТРА ГЛОБАЛЬНОЙ КОНТРАСТНОСТИ (5-Й ШЕЙДЕР)
 ID3D11RenderTargetView* g_pStage3RTV = NULL; // Холст для записи HDR-фильтра
@@ -72,13 +72,33 @@ ID3D11RenderTargetView* g_pStageMasterRTV = NULL;   // Холст для зап�
 ID3D11ShaderResourceView* g_pStageMasterSRV = NULL; // Ссылка на мастер-кадр для последующего сжатия
 
 // Текстуры и холсты для Стадии 1 (сжатие 4х4)
-ID3D11Texture2D* g_pStage1Texture = nullptr;
+ID3D11Texture2D* g_pTexCompressed = nullptr;
+
+// ЭКСПЕРИМЕНТАЛЬНЫЙ ЭТАП: Дважды сжатое монохромное поле (Промежуточный масштаб 16х16)
+ID3D11Texture2D* g_pTexDoubleCompressed = nullptr;
+ID3D11RenderTargetView* g_pRTVDoubleCompressed = nullptr;
+ID3D11ShaderResourceView* g_pSRVDoubleCompressed = nullptr;
+ID3D11Texture2D* g_pStagingDoubleCompressed = nullptr;
 
 // Текстуры и холсты для Стадии 2 (сжатие 8х8)
-ID3D11Texture2D* g_pStage2Texture = nullptr;
+ID3D11Texture2D* g_pTexStretched = nullptr;
+
+ID3D11Texture2D* g_pStagingStretched = nullptr; // Добавляем буфер обмена!
+
+// Текстуры и холсты для Стадии 2 (Сжатое монохромное поле / макроструктура 8х8)
+
+// Текстуры и холсты для Стадии 3 (Растянутое после сжатия / тест заглушек)
+
+// СТАДИЯ 4: Разность (Исходное изображение минус Растянутое = Выделенные четкие границы)
+ID3D11Texture2D* g_pTexDifference = nullptr;
+ID3D11RenderTargetView* g_pRTVDifference = nullptr;
+ID3D11ShaderResourceView* g_pSRVDifference = nullptr;
+ID3D11Texture2D* g_pStagingDifference = nullptr;
 
 // === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
+
+// === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
 ID3D11PixelShader* g_pPixelShaderDown = nullptr; // Шейдер сжатия 4х4
 ID3D11PixelShader* g_pPixelShaderDown4x4 = nullptr; // Шейдер сжатия 8х8
 ID3D11VertexShader* g_pDiagnosticVS = nullptr;
@@ -120,7 +140,7 @@ bool g_bNeedCopyStretched = true;  // НОВЫЙ уникальный флаг �
 // === ОБЪЯВЛЕНИЕ ВНЕШНИХ ПЕРЕМЕННЫХ ИЗ ПАНЕЛИ ДИАГНОСТИКИ ===
 extern UINT* pPixelsBuffer;
 extern UINT* pRawPixels;
-extern ID3D11Texture2D* g_pTextureStaging;
+extern ID3D11Texture2D* g_pStagingCompressed;
 extern UINT* pCompressedBuffer4x;   // Внешний буфер сжатия из my_debug.cpp
 extern UINT* pStretchedBuffer;      // Буфер для хранения кадра, растянутого обратно после сжатия
 
@@ -486,10 +506,10 @@ HRESULT InitDevice(HWND hwnd)
     if (SUCCEEDED(hr))
     {
         // Создаем "взгляд для записи" (RenderTargetView) — сюда 3-й шейдер будет писать данные
-        g_pd3dDevice->CreateRenderTargetView(pStage1Tex, NULL, &g_pStage1RTV);
+        g_pd3dDevice->CreateRenderTargetView(pStage1Tex, NULL, &g_pRTVCompressed);
 
         // Создаем "взгляд для чтения" (ShaderResourceView) — отсюда 4-й шейдер будет их забирать
-        g_pd3dDevice->CreateShaderResourceView(pStage1Tex, NULL, &g_pStage1SRV);
+        g_pd3dDevice->CreateShaderResourceView(pStage1Tex, NULL, &g_pSRVCompressed);
 
         pStage1Tex->Release(); // Саму текстуру видеокарта удержит внутри интерфейсов
     }
@@ -512,10 +532,10 @@ HRESULT InitDevice(HWND hwnd)
     if (SUCCEEDED(hr))
     {
         // Создаем RenderTargetView — сюда 4-й шейдер запишет укрупненные данные 8х8
-        g_pd3dDevice->CreateRenderTargetView(pStage2Tex, NULL, &g_pStage2RTV);
+        g_pd3dDevice->CreateRenderTargetView(pStage2Tex, NULL, &g_pRTVStretched);
 
         // Создаем ShaderResourceView — отсюда данные заберет финальный сборочный шейдер
-        g_pd3dDevice->CreateShaderResourceView(pStage2Tex, NULL, &g_pStage2SRV);
+        g_pd3dDevice->CreateShaderResourceView(pStage2Tex, NULL, &g_pSRVStretched);
 
         pStage2Tex->Release();
     }
@@ -619,21 +639,21 @@ void Render()
     UINT s1Height = (fileHeight / 4 > 0) ? fileHeight / 4 : 1;
 
     // Если холст уже существует, но его размеры не совпадают с новыми — пересоздаем его
-    if (g_pStage1Texture)
+    if (g_pTexCompressed)
     {
         D3D11_TEXTURE2D_DESC currentDesc;
-        g_pStage1Texture->GetDesc(&currentDesc);
+        g_pTexCompressed->GetDesc(&currentDesc);
         if (currentDesc.Width != s1Width || currentDesc.Height != s1Height)
         {
             if (g_pStageDown4SRV) { g_pStageDown4SRV->Release(); g_pStageDown4SRV = nullptr; }
             if (g_pStageDown4RTV) { g_pStageDown4RTV->Release(); g_pStageDown4RTV = nullptr; }
-            g_pStage1Texture->Release();
-            g_pStage1Texture = nullptr;
+            g_pTexCompressed->Release();
+            g_pTexCompressed = nullptr;
         }
     }
 
     // Физически выделяем память на видеокарте, если холста еще нет
-    if (g_pStage1Texture == nullptr)
+    if (g_pTexCompressed == nullptr)
     {
         D3D11_TEXTURE2D_DESC descS1 = {};
         descS1.Width = s1Width;
@@ -648,12 +668,12 @@ void Render()
         descS1.CPUAccessFlags = 0;
         descS1.MiscFlags = 0;
 
-        HRESULT hr_s1 = g_pd3dDevice->CreateTexture2D(&descS1, nullptr, &g_pStage1Texture);
+        HRESULT hr_s1 = g_pd3dDevice->CreateTexture2D(&descS1, nullptr, &g_pTexCompressed);
         if (SUCCEEDED(hr_s1))
         {
             // Привязываем текстуру Стадии 1 к её СОБСТВЕННЫМ уникальным указателям
-            g_pd3dDevice->CreateRenderTargetView(g_pStage1Texture, nullptr, &g_pStage1RTV);
-            g_pd3dDevice->CreateShaderResourceView(g_pStage1Texture, nullptr, &g_pStage1SRV);
+            g_pd3dDevice->CreateRenderTargetView(g_pTexCompressed, nullptr, &g_pRTVCompressed);
+            g_pd3dDevice->CreateShaderResourceView(g_pTexCompressed, nullptr, &g_pSRVCompressed);
         }
     }
 
@@ -670,20 +690,20 @@ void Render()
     UINT s2Width = fileWidth;   // СТАЛО: ПОЛНЫЙ РАЗМЕР (Вместо fileWidth / 8)
     UINT s2Height = fileHeight; // СТАЛО: ПОЛНЫЙ РАЗМЕР (Вместо fileHeight / 8)
 
-    if (g_pStage2Texture)
+    if (g_pTexStretched)
     {
         D3D11_TEXTURE2D_DESC currentDesc2;
-        g_pStage2Texture->GetDesc(&currentDesc2);
+        g_pTexStretched->GetDesc(&currentDesc2);
         if (currentDesc2.Width != s2Width || currentDesc2.Height != s2Height)
         {
             if (g_pStageDown4SRV) { g_pStageDown4SRV->Release(); g_pStageDown4SRV = nullptr; }
             if (g_pStageDown4RTV) { g_pStageDown4RTV->Release(); g_pStageDown4RTV = nullptr; }
-            g_pStage2Texture->Release();
-            g_pStage2Texture = nullptr;
+            g_pTexStretched->Release();
+            g_pTexStretched = nullptr;
         }
     }
 
-    if (g_pStage2Texture == nullptr)
+    if (g_pTexStretched == nullptr)
     {
         D3D11_TEXTURE2D_DESC descS2 = {};
         descS2.Width = s2Width;   // Теперь сюда придет полный размер 4128
@@ -698,11 +718,11 @@ void Render()
         descS2.CPUAccessFlags = 0;
         descS2.MiscFlags = 0;
 
-        HRESULT hr_s2 = g_pd3dDevice->CreateTexture2D(&descS2, nullptr, &g_pStage2Texture);
+        HRESULT hr_s2 = g_pd3dDevice->CreateTexture2D(&descS2, nullptr, &g_pTexStretched);
         if (SUCCEEDED(hr_s2))
         {
-            g_pd3dDevice->CreateRenderTargetView(g_pStage2Texture, nullptr, &g_pStage2RTV);
-            g_pd3dDevice->CreateShaderResourceView(g_pStage2Texture, nullptr, &g_pStage2SRV);
+            g_pd3dDevice->CreateRenderTargetView(g_pTexStretched, nullptr, &g_pRTVStretched);
+            g_pd3dDevice->CreateShaderResourceView(g_pTexStretched, nullptr, &g_pSRVStretched);
         }
     }
 
@@ -746,8 +766,8 @@ void Render()
     // ПАСС НУЛЕВОЙ: ЗАПУСК ПЕРВОГО ШАГА СЖАТИЯ (БЛОКИ 4х4 В КАНАЛЫ R, G, B, A)
     // ========================================================================
     float ClearColorS1[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pStage1RTV, ClearColorS1);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage1RTV, nullptr);
+    g_pImmediateContext->ClearRenderTargetView(g_pRTVCompressed, ClearColorS1);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVCompressed, nullptr);
     g_pImmediateContext->RSSetViewports(1, &vpStage1);
     g_pImmediateContext->PSSetShader(g_pPixelShaderDown, nullptr, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
@@ -782,8 +802,8 @@ void Render()
     // ПАСС ВТОРОЙ: АППАРАТНОЕ РАСТЯЖЕНИЕ МАКРОСТРУКТУРЫ (64 РАЗНЫХ ПИКСЕЛЯ!)
     // ========================================================================
     float ClearColorStage2[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearColorStage2);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage2RTV, nullptr);
+    g_pImmediateContext->ClearRenderTargetView(g_pRTVStretched, ClearColorStage2);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVStretched, nullptr);
     g_pImmediateContext->RSSetViewports(1, &vpStage2);
 
     // === НАЧАЛО ИЗМЕНЕНИЯ ===
@@ -796,7 +816,7 @@ void Render()
     g_pImmediateContext->VSSetShader(g_pDiagnosticVS, nullptr, 0);
 
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage2, nullptr, 0);
-    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pStage1SRV);
+    g_pImmediateContext->PSSetShaderResources(1, 1, &g_pSRVCompressed);
     g_pImmediateContext->Draw(4, 0);
 
     // ВАЖНО: Возвращаем базовый вершинный шейдер плеера на место, чтобы Пасс Ноль не ломался!
@@ -815,7 +835,7 @@ void Render()
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);     // t0: Исходный оригинал кадра 1:1
-    g_pImmediateContext->PSSetShaderResources(4, 1, &g_pStage2SRV);      // t4: Растянутое плавное поле из Stage2
+    g_pImmediateContext->PSSetShaderResources(4, 1, &g_pSRVStretched);      // t4: Растянутое плавное поле из Stage2
 
     g_pImmediateContext->Draw(4, 0);
 
@@ -823,38 +843,18 @@ void Render()
     // ========================================================================
     // НОВЫЙ БЛОК: СКАЧИВАНИЕ ГОТОВОГО СЛЕПКА GPU ДЛЯ КОНТРОЛЯ В РЕЖИМЕ 4
     // ========================================================================
-    if (g_bNeedCopyStretched && g_pStage2SRV)
+    if (g_bNeedCopyStretched && g_pSRVStretched && g_pStagingStretched)
     {
-        ID3D11Resource* pResSource = NULL;
-        g_pStage2SRV->GetResource(&pResSource);
+        ID3D11Resource* pResSource = nullptr;
+        g_pSRVStretched->GetResource(&pResSource);
 
-        if (pResSource && g_pTextureStaging)
+        if (pResSource)
         {
-            g_pImmediateContext->CopyResource(g_pTextureStaging, pResSource);
-
-            D3D11_MAPPED_SUBRESOURCE mappedResource;
-            HRESULT hr = g_pImmediateContext->Map(g_pTextureStaging, 0, D3D11_MAP_READ, 0, &mappedResource);
-            if (SUCCEEDED(hr))
-            {
-                UINT* pSrcPixels = (UINT*)mappedResource.pData;
-                UINT rowPitch = mappedResource.RowPitch / sizeof(UINT);
-
-                for (UINT y = 0; y < g_currentImgHeight; y++)
-                {
-                    UINT srcRowOffset = y * rowPitch;
-                    UINT dstRowOffset = y * g_currentImgWidth;
-
-                    for (UINT x = 0; x < g_currentImgWidth; x++)
-                    {
-                        pStretchedBuffer[dstRowOffset + x] = pSrcPixels[srcRowOffset + x];
-                    }
-                }
-                g_pImmediateContext->Unmap(g_pTextureStaging, 0);
-            }
+            g_pImmediateContext->CopyResource(g_pStagingStretched, pResSource);
             pResSource->Release();
         }
-        g_bNeedCopyStretched = false;
     }
+    g_bNeedCopyStretched = false;
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
@@ -989,18 +989,18 @@ void RenderSplit()
     float ClearBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
     // Проход 1 (Stage1)
-    g_pImmediateContext->ClearRenderTargetView(g_pStage1RTV, ClearBlack);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage1RTV, NULL);
+    g_pImmediateContext->ClearRenderTargetView(g_pRTVCompressed, ClearBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVCompressed, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShader, NULL, 0);
     g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
     g_pImmediateContext->Draw(4, 0);
 
     // Проход 2 (Stage2)
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
-    g_pImmediateContext->ClearRenderTargetView(g_pStage2RTV, ClearBlack);
-    g_pImmediateContext->OMSetRenderTargets(1, &g_pStage2RTV, NULL);
+    g_pImmediateContext->ClearRenderTargetView(g_pRTVStretched, ClearBlack);
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVStretched, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage2, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage1SRV);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pSRVCompressed);
     g_pImmediateContext->Draw(4, 0);
 
     // Проход 3 (Stage3)
@@ -1008,7 +1008,7 @@ void RenderSplit()
     g_pImmediateContext->ClearRenderTargetView(g_pStage3RTV, ClearBlack);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pStage3RTV, NULL);
     g_pImmediateContext->PSSetShader(g_pPixelShaderStage3, NULL, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pStage2SRV);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pSRVStretched);
     g_pImmediateContext->Draw(4, 0);
 
     // --- ВЫВОД НА ЭКРАН В ДВА ПОРТА ПРОСМОТРА ---
@@ -1067,10 +1067,10 @@ void CleanupDevice()
 {
     if (g_pImmediateContext) g_pImmediateContext->ClearState();
 
-    if (g_pStage1SRV) { g_pStage1SRV->Release(); g_pStage1SRV = NULL; }
-    if (g_pStage1RTV) { g_pStage1RTV->Release(); g_pStage1RTV = NULL; }
-    if (g_pStage2SRV) { g_pStage2SRV->Release(); g_pStage2SRV = NULL; } // НОВОЕ: Очистка ресурса чтения Stage2
-    if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; } // НОВОЕ: Очистка холста записи Stage2
+    if (g_pSRVCompressed) { g_pSRVCompressed->Release(); g_pSRVCompressed = NULL; }
+    if (g_pRTVCompressed) { g_pRTVCompressed->Release(); g_pRTVCompressed = NULL; }
+    if (g_pSRVStretched) { g_pSRVStretched->Release(); g_pSRVStretched = NULL; } // НОВОЕ: Очистка ресурса чтения Stage2
+    if (g_pRTVStretched) { g_pRTVStretched->Release(); g_pRTVStretched = NULL; } // НОВОЕ: Очистка холста записи Stage2
     if (g_pStage3SRV) { g_pStage3SRV->Release(); g_pStage3SRV = NULL; }
     if (g_pStage3RTV) { g_pStage3RTV->Release(); g_pStage3RTV = NULL; }
     if (g_pStageMasterSRV) { g_pStageMasterSRV->Release(); g_pStageMasterSRV = NULL; }
@@ -1293,10 +1293,10 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
         if (SUCCEEDED(hr))
         {
             // Чисто освобождаем все старые скрытые буферы из видеопамяти [INDEX_45, INDEX_46]
-            if (g_pStage1RTV) { g_pStage1RTV->Release(); g_pStage1RTV = NULL; }
-            if (g_pStage1SRV) { g_pStage1SRV->Release(); g_pStage1SRV = NULL; }
-            if (g_pStage2RTV) { g_pStage2RTV->Release(); g_pStage2RTV = NULL; }
-            if (g_pStage2SRV) { g_pStage2SRV->Release(); g_pStage2SRV = NULL; }
+            if (g_pRTVCompressed) { g_pRTVCompressed->Release(); g_pRTVCompressed = NULL; }
+            if (g_pSRVCompressed) { g_pSRVCompressed->Release(); g_pSRVCompressed = NULL; }
+            if (g_pRTVStretched) { g_pRTVStretched->Release(); g_pRTVStretched = NULL; }
+            if (g_pSRVStretched) { g_pSRVStretched->Release(); g_pSRVStretched = NULL; }
             if (g_pStage3RTV) { g_pStage3RTV->Release(); g_pStage3RTV = NULL; }
             if (g_pStage3SRV) { g_pStage3SRV->Release(); g_pStage3SRV = NULL; }
 
@@ -1320,8 +1320,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
             ID3D11Texture2D* pTexS1 = NULL;
             if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&descS1, NULL, &pTexS1))) {
-                g_pd3dDevice->CreateRenderTargetView(pTexS1, NULL, &g_pStage1RTV);
-                g_pd3dDevice->CreateShaderResourceView(pTexS1, NULL, &g_pStage1SRV);
+                g_pd3dDevice->CreateRenderTargetView(pTexS1, NULL, &g_pRTVCompressed);
+                g_pd3dDevice->CreateShaderResourceView(pTexS1, NULL, &g_pSRVCompressed);
                 pTexS1->Release();
             }
 
@@ -1339,8 +1339,8 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
             ID3D11Texture2D* pTexS2 = NULL;
             if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&descS2, NULL, &pTexS2))) {
-                g_pd3dDevice->CreateRenderTargetView(pTexS2, NULL, &g_pStage2RTV);
-                g_pd3dDevice->CreateShaderResourceView(pTexS2, NULL, &g_pStage2SRV);
+                g_pd3dDevice->CreateRenderTargetView(pTexS2, NULL, &g_pRTVStretched);
+                g_pd3dDevice->CreateShaderResourceView(pTexS2, NULL, &g_pSRVStretched);
                 pTexS2->Release();
             }
 
