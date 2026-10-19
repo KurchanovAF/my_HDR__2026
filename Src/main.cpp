@@ -55,24 +55,26 @@ HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixe
 // Глобальный указатель на буфер констант
 ID3D11Buffer* g_pConstantBuffer = NULL;
 
-// === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ СВЕРТКИ АНАЛИЗА БЛОКОВ 4х4 ===
-ID3D11RenderTargetView* g_pRTVCompressed = NULL; // Холст для записи фиолетового анализа 3-го шейдера
-ID3D11ShaderResourceView* g_pSRVCompressed = NULL; // Ссылка на этот анализ для следующего шейдера
+// ========================================================================
+// ПОЛНЫЙ НАБОР СИСТЕМНЫХ ТЕКСТУР И СВЯЗЕЙ ДЛЯ ВСЕХ СТАДИЙ ДЕФЕКТОВЕДЕНИЯ
+// ========================================================================
 
-// === НОВЫЙ КОД: ОБЪЕКТЫ ДЛЯ УКРУПНЕННОГО АНАЛИЗА МАКРОБЛОКОВ 8х8 ===
-ID3D11RenderTargetView* g_pRTVStretched = NULL; // Холст для записи макроанализа 4-го шейдера
-ID3D11ShaderResourceView* g_pSRVStretched = NULL; // Ссылка на макроанализ для последующих шейдеров
+// СТАДИЯ 0: Исходное цветное изображение (Оригинал 1:1)
+ID3D11Texture2D* g_pTexOriginal = nullptr;
+ID3D11ShaderResourceView* g_pSRVOriginal = nullptr;
+ID3D11Texture2D* g_pStagingOriginal = nullptr;
 
-// ОБЪЕКТЫ ДЛЯ ФИЛЬТРА ГЛОБАЛЬНОЙ КОНТРАСТНОСТИ (5-Й ШЕЙДЕР)
-ID3D11RenderTargetView* g_pStage3RTV = NULL; // Холст для записи HDR-фильтра
-ID3D11ShaderResourceView* g_pStage3SRV = NULL; // Ссылка на этот результат
+// СТАДИЯ 1: Монохромный кадр (Черно-белый оригинал 1:1)
+ID3D11Texture2D* g_pTexMonochrome = nullptr;
+ID3D11RenderTargetView* g_pRTVMonochrome = nullptr;
+ID3D11ShaderResourceView* g_pSRVMonochrome = nullptr;
+ID3D11Texture2D* g_pStagingMonochrome = nullptr;
 
-// === НОВЫЙ КОД: МАСТЕР-БУФЕР ДЛЯ ПОЛНОРАЗМЕРНОЙ СКЛЕЙКИ ШТОРКИ ===
-ID3D11RenderTargetView* g_pStageMasterRTV = NULL;   // Холст для записи полноразмерной шторки
-ID3D11ShaderResourceView* g_pStageMasterSRV = NULL; // Ссылка на мастер-кадр для последующего сжатия
-
-// Текстуры и холсты для Стадии 1 (сжатие 4х4)
+// СТАДИЯ 2: Сжатое монохромное поле (Характеристика макроструктуры 4х4)
 ID3D11Texture2D* g_pTexCompressed = nullptr;
+ID3D11RenderTargetView* g_pRTVCompressed = nullptr;
+ID3D11ShaderResourceView* g_pSRVCompressed = nullptr;
+ID3D11Texture2D* g_pStagingCompressed = nullptr;
 
 // ЭКСПЕРИМЕНТАЛЬНЫЙ ЭТАП: Дважды сжатое монохромное поле (Промежуточный масштаб 16х16)
 ID3D11Texture2D* g_pTexDoubleCompressed = nullptr;
@@ -80,44 +82,56 @@ ID3D11RenderTargetView* g_pRTVDoubleCompressed = nullptr;
 ID3D11ShaderResourceView* g_pSRVDoubleCompressed = nullptr;
 ID3D11Texture2D* g_pStagingDoubleCompressed = nullptr;
 
-// Текстуры и холсты для Стадии 2 (сжатие 8х8)
+// СТАДИЯ 3: Растянутое после сжатия (Глобальный сглаженный контраст без четких границ)
 ID3D11Texture2D* g_pTexStretched = nullptr;
+ID3D11RenderTargetView* g_pRTVStretched = nullptr;
+ID3D11ShaderResourceView* g_pSRVStretched = nullptr;
+ID3D11Texture2D* g_pStagingStretched = nullptr;
 
-ID3D11Texture2D* g_pStagingStretched = nullptr; // Добавляем буфер обмена!
-
-// Текстуры и холсты для Стадии 2 (Сжатое монохромное поле / макроструктура 8х8)
-
-// Текстуры и холсты для Стадии 3 (Растянутое после сжатия / тест заглушек)
-
-// СТАДИЯ 4: Разность (Исходное изображение минус Растянутое = Выделенные четкие границы)
+// СТАДИЯ 4: Разность (Исходное минус Растянутое = Выделенные четкие границы отдельно от контраста)
 ID3D11Texture2D* g_pTexDifference = nullptr;
 ID3D11RenderTargetView* g_pRTVDifference = nullptr;
 ID3D11ShaderResourceView* g_pSRVDifference = nullptr;
 ID3D11Texture2D* g_pStagingDifference = nullptr;
 
-// === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
-ID3D11PixelShader* g_pPixelShaderDownsample = NULL; // Указатель на новый шейдер сжатия
+// СТАДИЯ 5: Преобразованное сжатое монохромное поле
+ID3D11Texture2D* g_pTexTransformed = nullptr;
+ID3D11RenderTargetView* g_pRTVTransformed = nullptr;
+ID3D11ShaderResourceView* g_pSRVTransformed = nullptr;
+ID3D11Texture2D* g_pStagingTransformed = nullptr;
 
-// === ТЕКСТУРНЫЕ БУФЕРЫ ДЛЯ СТАДИЙ ШЕЙДЕРНОГО СЖАТИЯ ===
-ID3D11PixelShader* g_pPixelShaderDown = nullptr; // Шейдер сжатия 4х4
-ID3D11PixelShader* g_pPixelShaderDown4x4 = nullptr; // Шейдер сжатия 8х8
+// СТАДИЯ 6: Мастер-буфер для полноразмерной склейки шторки плеера "До / После"
+ID3D11Texture2D* g_pTexMasterSplit = nullptr;
+ID3D11RenderTargetView* g_pStageMasterRTV = nullptr;
+ID3D11ShaderResourceView* g_pStageMasterSRV = nullptr;
+
+// ОБЪЕКТЫ ДЛЯ ФИЛЬТРА ГЛОБАЛЬНОЙ КОНТРАСТНОСТИ (СТАРАЯ СИСТЕМНАЯ ЧАСТЬ 5-ГО ШЕЙДЕРА)
+ID3D11RenderTargetView* g_pStage3RTV = nullptr;
+ID3D11ShaderResourceView* g_pStage3SRV = nullptr;
+
+// === ТЕКСТУРНЫЕ УКАЗАТЕЛИ ДЛЯ КОМПИЛЯЦИИ И ЗАПУСКА HLSL ШЕЙДЕРОВ ===
+ID3D11VertexShader* g_pVertexShader = nullptr;
 ID3D11VertexShader* g_pDiagnosticVS = nullptr;
+ID3D11PixelShader* g_pPixelShader = nullptr;
+ID3D11PixelShader* g_pPixelShaderCopy = nullptr;
+ID3D11PixelShader* g_pPixelShaderDownsample = nullptr;
+ID3D11PixelShader* g_pPixelShaderDown = nullptr;
+ID3D11PixelShader* g_pPixelShaderDown4x4 = nullptr;
+ID3D11PixelShader* g_pPixelShaderStage2 = nullptr;
+ID3D11PixelShader* g_pPixelShaderStage3 = nullptr;
+ID3D11PixelShader* g_pPixelShaderFinal = nullptr;
 
-// Стадия 1:2
+// СТАРЫЕ ИНДЕКСЫ МАСШТАБИРОВАНИЯ (ОСТАВЛЯЕМ ДЛЯ СОВМЕСТИМОСТИ С КОДОМ АНАТОЛИЯ ФЕДОРОВИЧА)
 ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown2SRV = NULL;
-
-// Стадия 1:4
 ID3D11RenderTargetView* g_pStageDown4RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown4SRV = NULL;
-
-// Стадия 1:16
 ID3D11RenderTargetView* g_pStageDown16RTV = NULL;
 ID3D11ShaderResourceView* g_pStageDown16SRV = NULL;
 
-// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-HWND                    hwnd;
-HWND                    g_hStatusWnd = NULL;           // Дескриптор строки статуса внизу плеера
+// СТРОКИ, КОТОРЫЕ ИДУТ ДАЛЬШЕ И ОСТАЮТСЯ НЕИЗМЕННЫМИ:
+HWND hwnd; // НЕ ИЗМЕНЯЕТСЯ (Страница 4 PDF)
+HWND g_hStatusWnd = NULL;
 
 // Размеры оригинального кадра
 UINT g_srcImgWidth = 0;
@@ -186,13 +200,6 @@ ID3D11Device* g_pd3dDevice = NULL;        // Видеокарта
 ID3D11DeviceContext* g_pImmediateContext = NULL; // Контекст команд
 IDXGISwapChain* g_pSwapChain = NULL;        // Буфер экрана
 ID3D11RenderTargetView* g_pRenderTargetView = NULL; // Окно вывода
-
-ID3D11VertexShader* g_pVertexShader = NULL;     // Вершинный шейдер
-ID3D11PixelShader* g_pPixelShader = NULL;      // Пиксельный шейдер
-ID3D11PixelShader* g_pPixelShaderStage2 = NULL; // НОВОЕ: Указатель на 4-й шейдер анализа макроблоков 8х8
-ID3D11PixelShader* g_pPixelShaderStage3 = NULL; // НОВОЕ: Указатель на 5-й шейдер адаптивной фильтрации контраста
-ID3D11PixelShader* g_pPixelShaderFinal = NULL;  // НОВОЕ: Указатель на 6-й шейдер финальной цветокоррекции и гаммы
-ID3D11PixelShader* g_pPixelShaderCopy = NULL;  // Указатель на новый чистый шейдер копирования кадра
 
 ID3D11InputLayout* g_pVertexLayout = NULL;     // Формат вершин
 ID3D11Buffer* g_pVertexBuffer = NULL;     // Буфер геометрии
@@ -1724,7 +1731,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
 // === ИСТИННАЯ ПРОГРАММНАЯ ОБРАБОТКА ИЗ 2011 ГОДА НА ЦЕНТРАЛЬНОМ ПРОЦЕССОРЕ (CPU) ===
 // === ИСТИННАЯ ПИРАМИДАЛЬНАЯ ФИЛЬТРАЦИЯ 2011 ГОДА НА ПРОЦЕССОРЕ (CPU) ===
-HRESULT ApplyCpuFilter(unsigned int* pSrcPixels, unsigned int width, unsigned int height, unsigned int* pOutPixels)
+HRESULT ApplyCpuFilter(UINT* pSrcPixels, UINT width, UINT height, UINT* pOutPixels)
 {
     if (!pSrcPixels || !pOutPixels || width == 0 || height == 0) return E_INVALIDARG;
 
