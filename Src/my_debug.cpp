@@ -269,108 +269,101 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
         switch (g_diagMode)
         {
-        case 0: // Режим 1: Исходный
+        case 0: // Режим 1: Исходный (ВЫВОД ТОЧНОЙ КОПИИ GPU ИЗ pRawPixels ЧЕРЕЗ BITBLT)
         {
-            // Очищаем фон ОДИН раз
-            HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(hdc, &ps.rcPaint, hBg); // Очищаем строго область запроса, а не весь 400х400
-            DeleteObject(hBg);
-
-            if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            if (pRawPixels != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                // Прямо запрашиваем у Windows текущие размеры видимой страницы ползунков
-                SCROLLINFO siH = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
-                GetScrollInfo(hWnd, SB_HORZ, &siH);
-                SCROLLINFO siV = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
-                GetScrollInfo(hWnd, SB_VERT, &siV);
+                int startX = g_dlgScrollX;
+                int startY = g_dlgScrollY;
 
-                // В режиме 1:1 индексы считывания равны чистой позиции бегунка
-                UINT startX = siH.nPos;
-                UINT startY = siV.nPos;
+                RECT rcClient;
+                GetClientRect(hWnd, &rcClient);
+                int winW = rcClient.right - rcClient.left;
+                int winH = rcClient.bottom - rcClient.top;
+                if (winW <= 0 || winH <= 0) break;
 
-                // Граница перебора равна позиции старта плюс физическая ширина видимой страницы окна
-                UINT endX = startX + siH.nPage;
-                UINT endY = startY + siV.nPage;
+                HDC hMemDC = CreateCompatibleDC(hdc);
 
-                if (endX > g_currentImgWidth) endX = g_currentImgWidth;
-                if (endY > g_currentImgHeight) endY = g_currentImgHeight;
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = g_currentImgWidth;
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight; // Сверху вниз
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
 
-                for (UINT y = startY; y < endY; y++)
+                void* pBits = nullptr;
+                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                if (hBmp && pBits)
                 {
-                    UINT rowOffset = y * g_currentImgWidth;
-                    for (UINT x = startX; x < endX; x++)
-                    {
-                        DWORD color = pRawPixels[rowOffset + x];
-                        BYTE b = (BYTE)(color & 0xFF);
-                        BYTE g = (BYTE)((color >> 8) & 0xFF);
-                        BYTE r = (BYTE)((color >> 16) & 0xFF);
+                    memcpy(pBits, pRawPixels, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
+                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
-                        HBRUSH hPxlBrush = CreateSolidBrush(RGB(r, g, b));
-                        RECT pxlRect = {
-                            (int)(x - startX),
-                            (int)(y - startY),
-                            (int)(x - startX + 1),
-                            (int)(y - startY + 1)
-                        };
-                        FillRect(hdc, &pxlRect, hPxlBrush);
-                        DeleteObject(hPxlBrush);
-                    }
+                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                    FillRect(hdc, &rcClient, hBg);
+                    DeleteObject(hBg);
+
+                    int viewW = ((startX + winW) > (int)g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
+                    int viewH = ((startY + winH) > (int)g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
+
+                    BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
+
+                    SelectObject(hMemDC, hOldBmp);
+                    DeleteObject(hBmp);
                 }
+                DeleteDC(hMemDC);
             }
         }
         break;
-        case 1: // Режим 2: Монохромный
+
+        case 1: // Режим 2: Монохромный (КОНТРОЛЬ GPU ИЗ СКАЧАННОГО БУФЕРА ЧЕРЕЗ BITBLT)
         {
-            HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(hdc, &ps.rcPaint, hBg);
-            DeleteObject(hBg);
-
-            if (pPixelsBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            if (pRawPixels != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                // Прямо запрашиваем у Windows текущие размеры видимой страницы ползунков
-                SCROLLINFO siH = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
-                GetScrollInfo(hWnd, SB_HORZ, &siH);
-                SCROLLINFO siV = { sizeof(SCROLLINFO), SIF_POS | SIF_PAGE };
-                GetScrollInfo(hWnd, SB_VERT, &siV);
+                int startX = g_dlgScrollX;
+                int startY = g_dlgScrollY;
 
-                // В режиме 1:1 индексы считывания равны чистой позиции бегунка
-                UINT startX = siH.nPos;
-                UINT startY = siV.nPos;
+                RECT rcClient;
+                GetClientRect(hWnd, &rcClient);
+                int winW = rcClient.right - rcClient.left;
+                int winH = rcClient.bottom - rcClient.top;
+                if (winW <= 0 || winH <= 0) break;
 
-                // Граница перебора равна позиции старта плюс физическая ширина видимой страницы окна
-                UINT endX = startX + siH.nPage;
-                UINT endY = startY + siV.nPage;
+                HDC hMemDC = CreateCompatibleDC(hdc);
 
-                if (endX > g_currentImgWidth) endX = g_currentImgWidth;
-                if (endY > g_currentImgHeight) endY = g_currentImgHeight;
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = g_currentImgWidth;
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
 
-                for (UINT y = startY; y < endY; y++)
+                void* pBits = nullptr;
+                HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+                if (hBmp && pBits)
                 {
-                    UINT rowOffset = y * g_currentImgWidth;
-                    for (UINT x = startX; x < endX; x++)
-                    {
-                        DWORD color = pRawPixels[rowOffset + x];
-                        BYTE b = (BYTE)(color & 0xFF);
-                        BYTE g = (BYTE)((color >> 8) & 0xFF);
-                        BYTE r = (BYTE)((color >> 16) & 0xFF);
+                    // Так как мы делим буфер pRawPixels, здесь уже лежит скачанный монохром от GPU
+                    memcpy(pBits, pMonochromeBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
+                    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
-                        float grayVal = (float)r * 0.299f + (float)g * 0.587f + (float)b * 0.114f;
-                        BYTE gray = (BYTE)grayVal;
+                    HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
+                    FillRect(hdc, &rcClient, hBg);
+                    DeleteObject(hBg);
 
-                        HBRUSH hPxlBrush = CreateSolidBrush(RGB(gray, gray, gray));
-                        RECT pxlRect = {
-                            (int)(x - startX),
-                            (int)(y - startY),
-                            (int)(x - startX + 1),
-                            (int)(y - startY + 1)
-                        };
-                        FillRect(hdc, &pxlRect, hPxlBrush);
-                        DeleteObject(hPxlBrush);
-                    }
+                    int viewW = ((startX + winW) > (int)g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
+                    int viewH = ((startY + winH) > (int)g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
+
+                    BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
+
+                    SelectObject(hMemDC, hOldBmp);
+                    DeleteObject(hBmp);
                 }
+                DeleteDC(hMemDC);
             }
         }
         break;
+
         case 2: // Режим 3: Сжатый в 8 раз (ВЫВОД ЧЕРЕЗ БЫСТРЫЙ BITBLT)
         {
             if (pCompressedBuffer4x != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)

@@ -120,6 +120,7 @@ ID3D11PixelShader* g_pPixelShaderDown4x4 = nullptr;
 ID3D11PixelShader* g_pPixelShaderStage2 = nullptr;
 ID3D11PixelShader* g_pPixelShaderStage3 = nullptr;
 ID3D11PixelShader* g_pPixelShaderFinal = nullptr;
+ID3D11PixelShader* g_pPixelShaderMonochrome = nullptr;
 
 // СТАРЫЕ ИНДЕКСЫ МАСШТАБИРОВАНИЯ (ОСТАВЛЯЕМ ДЛЯ СОВМЕСТИМОСТИ С КОДОМ АНАТОЛИЯ ФЕДОРОВИЧА)
 ID3D11RenderTargetView* g_pStageDown2RTV = NULL;
@@ -147,6 +148,7 @@ UINT g_compressedHeight = 0;
 
 // === НАБОР ФЛАГОВ ДЛЯ ОДНОКРАТНОГО СКАЧИВАНИЯ КАДРА В CPU ===
 bool g_bNeedCopyOriginal = true;    // Флаг для копии исходного цветного файла
+bool g_bNeedCopyMonochrome = true;
 bool g_bNeedCopyStage3 = true;      // Флаг для монохромного кадра (Стадия 3)
 bool g_bNeedCopyCompressed = true;  // Флаг для макроструктуры 8х8 (Стадия 2)
 bool g_bNeedCopyStretched = true;  // НОВЫЙ уникальный флаг для Режима 4!
@@ -442,6 +444,13 @@ HRESULT InitDevice(HWND hwnd)
     hr = g_pd3dDevice->CreatePixelShader(pPSFinalBlob->GetBufferPointer(), pPSFinalBlob->GetBufferSize(), NULL, &g_pPixelShaderFinal);
     pPSFinalBlob->Release(); // Освобождаем память временного буфера компиляции
     if (FAILED(hr)) return hr;
+
+    ID3DBlob* pPSMonoBlob = NULL;
+    hr = CompileShaderFromFile(L"shaders.hlsl", "PS_Monochrome", "ps_4_0", &pPSMonoBlob);
+    if (FAILED(hr)) return hr;
+    hr = g_pd3dDevice->CreatePixelShader(pPSMonoBlob->GetBufferPointer(), pPSMonoBlob->GetBufferSize(), NULL, &g_pPixelShaderMonochrome);
+    pPSMonoBlob->Release();
+    if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
     // Создаем тестовую текстуру 2х2 пикселя (Черный и Белый в шахматном порядке)
@@ -497,7 +506,27 @@ HRESULT InitDevice(HWND hwnd)
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
 
-        // === НОВЫЙ КОД: СОЗДАЕМ СКРЫТУЮ ТЕКСТУРУ ДЛЯ РЕЗУЛЬТАТОВ 3-ГО ШЕЙДЕРА ===
+     // === НОВЫЙ КОД: СОЗДАЕМ СКРЫТУЮ ТЕКСТУРУ ДЛЯ АППАРАТНОГО МОНОХРОМА (СТАДИЯ 1) ===
+    D3D11_TEXTURE2D_DESC monoDesc = {};
+    monoDesc.Width = 2;
+    monoDesc.Height = 2;
+    monoDesc.MipLevels = 1;
+    monoDesc.ArraySize = 1;
+    monoDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    monoDesc.SampleDesc.Count = 1;
+    monoDesc.Usage = D3D11_USAGE_DEFAULT;
+    monoDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* pMonoTex = NULL;
+    hr = g_pd3dDevice->CreateTexture2D(&monoDesc, NULL, &pMonoTex);
+    if (SUCCEEDED(hr))
+    {
+        g_pd3dDevice->CreateRenderTargetView(pMonoTex, NULL, &g_pRTVMonochrome);
+        g_pd3dDevice->CreateShaderResourceView(pMonoTex, NULL, &g_pSRVMonochrome);
+        pMonoTex->Release();
+    }
+    if (FAILED(hr)) return hr;
+
+    // === НОВЫЙ КОД: СОЗДАЕМ СКРЫТУЮ ТЕКСТУРУ ДЛЯ РЕЗУЛЬТАТОВ 3-ГО ШЕЙДЕРА ===
     D3D11_TEXTURE2D_DESC stage1Desc = {};
     stage1Desc.Width = 2;                             // Размер точно соответствует исходному кадру
     stage1Desc.Height = 2;
@@ -661,6 +690,37 @@ void Render()
         g_bNeedCopyOriginal = false;
     }
 
+    // === ДИНАМИЧЕСКОЕ ПЕРЕСОЗДАНИЕ МОНОХРОМНОГО ХОЛСТА ПОД РАЗМЕР КАДРА ===
+    if (g_pTexMonochrome)
+    {
+        D3D11_TEXTURE2D_DESC mDesc;
+        g_pTexMonochrome->GetDesc(&mDesc);
+        if (mDesc.Width != fileWidth || mDesc.Height != fileHeight)
+        {
+            if (g_pSRVMonochrome) { g_pSRVMonochrome->Release(); g_pSRVMonochrome = nullptr; }
+            if (g_pRTVMonochrome) { g_pRTVMonochrome->Release(); g_pRTVMonochrome = nullptr; }
+            g_pTexMonochrome->Release();
+            g_pTexMonochrome = nullptr;
+        }
+    }
+    if (g_pTexMonochrome == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC descMono = {};
+        descMono.Width = fileWidth;
+        descMono.Height = fileHeight;
+        descMono.MipLevels = 1;
+        descMono.ArraySize = 1;
+        descMono.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        descMono.SampleDesc.Count = 1;
+        descMono.Usage = D3D11_USAGE_DEFAULT;
+        descMono.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&descMono, nullptr, &g_pTexMonochrome)))
+        {
+            g_pd3dDevice->CreateRenderTargetView(g_pTexMonochrome, nullptr, &g_pRTVMonochrome);
+            g_pd3dDevice->CreateShaderResourceView(g_pTexMonochrome, nullptr, &g_pSRVMonochrome);
+        }
+    }
+
     // Вычисляем размеры для Стадии 1 (строго в 4 раза меньше оригинала)
     UINT s1Width = (fileWidth / 4 > 0) ? fileWidth / 4 : 1;
     UINT s1Height = (fileHeight / 4 > 0) ? fileHeight / 4 : 1;
@@ -792,6 +852,66 @@ void Render()
     // ========================================================================
     // ПАСС НУЛЕВОЙ: ЗАПУСК ПЕРВОГО ШАГА СЖАТИЯ (БЛОКИ 4х4 В КАНАЛЫ R, G, B, A)
     // ========================================================================
+
+    // === 1. КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ ИСХОДНОГО ЦВЕТНОГО ОРИГИНАЛА ===
+    if (g_bNeedCopyOriginal && g_pTexOriginal && g_pStagingOriginal && pRawPixels != NULL)
+    {
+        g_pImmediateContext->CopyResource(g_pStagingOriginal, g_pTexOriginal);
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingOriginal, 0, D3D11_MAP_READ, 0, &mappedResource)))
+        {
+            BYTE* pSrc = (BYTE*)mappedResource.pData;
+            BYTE* pDst = (BYTE*)pRawPixels; // Цветной оригинал пишем в универсальный pRawPixels
+            UINT rowSize = g_currentImgWidth * sizeof(UINT);
+            for (UINT y = 0; y < g_currentImgHeight; y++)
+            {
+                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
+            }
+            g_pImmediateContext->Unmap(g_pStagingOriginal, 0);
+        }
+        g_bNeedCopyOriginal = false;
+    }
+
+    // === 2. КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА (РЕЖИМ 2) ===
+    if (g_bNeedCopyMonochrome && g_pTexMonochrome && g_pStagingMonochrome && pMonochromeBuffer != NULL)
+    {
+        g_pImmediateContext->CopyResource(g_pStagingMonochrome, g_pTexMonochrome);
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingMonochrome, 0, D3D11_MAP_READ, 0, &mappedResource)))
+        {
+            BYTE* pSrc = (BYTE*)mappedResource.pData;
+            BYTE* pDst = (BYTE*)pMonochromeBuffer; // Честный ЧБ слепок пишем строго в pMonochromeBuffer
+            UINT rowSize = g_currentImgWidth * sizeof(UINT);
+            for (UINT y = 0; y < g_currentImgHeight; y++)
+            {
+                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
+            }
+            g_pImmediateContext->Unmap(g_pStagingMonochrome, 0);
+        }
+        g_bNeedCopyMonochrome = false; // Опускаем наш выделенный флаг
+    }
+
+    // === АППАРАТНЫЙ ПАСС GPU: ПЕРЕВОД ОРИГИНАЛА 1:1 В МОНОХРОМ ===
+// Выполняем строго здесь, так как исходная текстура гарантированно готова к работе
+    if (g_pRTVMonochrome && g_pTextureSRV)
+    {
+        float ClearColorMono[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        g_pImmediateContext->ClearRenderTargetView(g_pRTVMonochrome, ClearColorMono);
+        g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVMonochrome, nullptr);
+
+        // Сетка под полный размер оригинала 1:1
+        D3D11_VIEWPORT vpMono = { 0.0f, 0.0f, renderW, renderH, 0.0f, 1.0f };
+        g_pImmediateContext->RSSetViewports(1, &vpMono);
+
+        // Запускаем наш аппаратный ЧБ-шейдер по исходной текстуре
+        g_pImmediateContext->PSSetShader(g_pPixelShaderMonochrome, nullptr, 0);
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+        g_pImmediateContext->Draw(4, 0);
+
+        // Сбрасываем цель рендера, чтобы освободить конвейер для пасса сжатия
+        g_pImmediateContext->OMSetRenderTargets(1, nullRTV, nullptr);
+    }
+
     float ClearColorS1[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     g_pImmediateContext->ClearRenderTargetView(g_pRTVCompressed, ClearColorS1);
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVCompressed, nullptr);
@@ -882,25 +1002,6 @@ void Render()
         }
     }
     g_bNeedCopyStretched = false;
-
-    // === КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА (STAGE 3 / РЕЖИМ 2) ===
-    if (g_bNeedCopyStage3 && g_pTexMonochrome && g_pStagingMonochrome && pRawPixels != NULL)
-    {
-        g_pImmediateContext->CopyResource(g_pStagingMonochrome, g_pTexMonochrome);
-        D3D11_MAPPED_SUBRESOURCE mappedResource;
-        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingMonochrome, 0, D3D11_MAP_READ, 0, &mappedResource)))
-        {
-            BYTE* pSrc = (BYTE*)mappedResource.pData;
-            BYTE* pDst = (BYTE*)pRawPixels; // Используем как универсальный буфер слепков
-            UINT rowSize = g_currentImgWidth * sizeof(UINT);
-            for (UINT y = 0; y < g_currentImgHeight; y++)
-            {
-                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
-            }
-            g_pImmediateContext->Unmap(g_pStagingMonochrome, 0);
-        }
-        g_bNeedCopyStage3 = false;
-    }
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
@@ -1134,6 +1235,7 @@ void CleanupDevice()
     if (g_pPixelShaderStage3) { g_pPixelShaderStage3->Release(); g_pPixelShaderStage3 = NULL; } // НОВОЕ: Очистка 5-го шейдера фильтрации
     if (g_pPixelShaderFinal) { g_pPixelShaderFinal->Release(); g_pPixelShaderFinal = NULL; } // НОВОЕ: Очистка 6-го шейдера цветокоррекции
     if (g_pPixelShaderCopy) { g_pPixelShaderCopy->Release(); g_pPixelShaderCopy = NULL; }
+    if (g_pPixelShaderMonochrome) { g_pPixelShaderMonochrome->Release(); g_pPixelShaderMonochrome = NULL; }
     if (g_pVertexShader) { g_pVertexShader->Release(); g_pVertexShader = NULL; }
     if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = NULL; }
@@ -1201,6 +1303,7 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
     // Переключаем флаги: принудительно просим видеокарту сделать 
     // один свежий слепок нового файла для панели диагностики
     g_bNeedCopyOriginal = true;
+    g_bNeedCopyMonochrome = true;
     g_bNeedCopyStage3 = true;
     g_bNeedCopyCompressed = true;
 

@@ -249,6 +249,14 @@ float4 PS_Copy(VS_OUTPUT input) : SV_Target
     return srcTexture.Sample(samplerState0, input.Tex);
 }
 
+// === НОВЫЙ ШЕЙДЕР: АППАРАТНЫЙ ПЕРЕВОД ОРИГИНАЛА 1:1 В ЧЕСТНЫЙ ЧБ ===
+float4 PS_Monochrome(VS_OUTPUT input) : SV_Target
+{
+    float4 src_color = srcTexture.Sample(samplerState0, input.Tex);
+    float src_gray = dot(src_color.rgb, WEIGHT);
+    return float4(src_gray, src_gray, src_gray, 1.0f);
+}
+
 // ВРЕМЕННАЯ ЗАГЛУШКА ДЛЯ ИНИЦИАЛИЗАЦИИ ОБЪЕКТА В MAIN.CPP
 float4 PS(VS_OUTPUT input) : SV_Target
 {
