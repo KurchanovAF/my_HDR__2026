@@ -19,6 +19,7 @@ extern ID3D11Texture2D* g_pStagingCompressed;              // Промежуто
 
 UINT* pPixelsBuffer = NULL;                             // Наш глобальный исходный массив кадра
 UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!
+UINT* pMonochromeBuffer = NULL;                         // Буфер для монохромного кадра CPU (Оригинал 1:1)
 UINT* pCompressedBuffer4x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
 UINT* pStretchedBuffer = NULL;                          // Буфер для хранения кадра, растянутого обратно после сжатия
 

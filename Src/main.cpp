@@ -154,6 +154,7 @@ bool g_bNeedCopyStretched = true;  // НОВЫЙ уникальный флаг �
 // === ОБЪЯВЛЕНИЕ ВНЕШНИХ ПЕРЕМЕННЫХ ИЗ ПАНЕЛИ ДИАГНОСТИКИ ===
 extern UINT* pPixelsBuffer;
 extern UINT* pRawPixels;
+extern UINT* pMonochromeBuffer;
 extern ID3D11Texture2D* g_pStagingCompressed;
 extern UINT* pCompressedBuffer4x;   // Внешний буфер сжатия из my_debug.cpp
 extern UINT* pStretchedBuffer;      // Буфер для хранения кадра, растянутого обратно после сжатия
@@ -641,6 +642,25 @@ void Render()
     float renderW = (float)fileWidth;
     float renderH = (float)fileHeight;
 
+    // === КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ ИСХОДНОГО ОРИГИНАЛА ===
+    if (g_bNeedCopyOriginal && g_pTexOriginal && g_pStagingOriginal && pRawPixels != NULL)
+    {
+        g_pImmediateContext->CopyResource(g_pStagingOriginal, g_pTexOriginal);
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingOriginal, 0, D3D11_MAP_READ, 0, &mappedResource)))
+        {
+            BYTE* pSrc = (BYTE*)mappedResource.pData;
+            BYTE* pDst = (BYTE*)pRawPixels;
+            UINT rowSize = g_currentImgWidth * sizeof(UINT);
+            for (UINT y = 0; y < g_currentImgHeight; y++)
+            {
+                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
+            }
+            g_pImmediateContext->Unmap(g_pStagingOriginal, 0);
+        }
+        g_bNeedCopyOriginal = false;
+    }
+
     // Вычисляем размеры для Стадии 1 (строго в 4 раза меньше оригинала)
     UINT s1Width = (fileWidth / 4 > 0) ? fileWidth / 4 : 1;
     UINT s1Height = (fileHeight / 4 > 0) ? fileHeight / 4 : 1;
@@ -862,6 +882,25 @@ void Render()
         }
     }
     g_bNeedCopyStretched = false;
+
+    // === КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА (STAGE 3 / РЕЖИМ 2) ===
+    if (g_bNeedCopyStage3 && g_pTexMonochrome && g_pStagingMonochrome && pRawPixels != NULL)
+    {
+        g_pImmediateContext->CopyResource(g_pStagingMonochrome, g_pTexMonochrome);
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingMonochrome, 0, D3D11_MAP_READ, 0, &mappedResource)))
+        {
+            BYTE* pSrc = (BYTE*)mappedResource.pData;
+            BYTE* pDst = (BYTE*)pRawPixels; // Используем как универсальный буфер слепков
+            UINT rowSize = g_currentImgWidth * sizeof(UINT);
+            for (UINT y = 0; y < g_currentImgHeight; y++)
+            {
+                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
+            }
+            g_pImmediateContext->Unmap(g_pStagingMonochrome, 0);
+        }
+        g_bNeedCopyStage3 = false;
+    }
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
@@ -1219,7 +1258,6 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 }
             }
         }
-//        delete[] pRawPixels; // Удаляем временный сырой буфер
 
         // 6. Если старая основная текстура уже была в памяти — чисто освобождаем её
         if (g_pTextureSRV) { g_pTextureSRV->Release(); g_pTextureSRV = NULL; }
@@ -1237,11 +1275,11 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
         D3D11_SUBRESOURCE_DATA initData = {};
         initData.pSysMem = pPixelsBuffer;
-        initData.SysMemPitch = paddedWidth * sizeof(UINT); // Задаем видеокарте шаг 184
+        initData.SysMemPitch = paddedWidth * sizeof(UINT);
 
         ID3D11Texture2D* pTexture = NULL;
-        desc.Width = paddedWidth;   // Задаем ширину текстуры 184
-        desc.Height = paddedHeight; // Задаем высоту текстуры 184
+        desc.Width = paddedWidth;
+        desc.Height = paddedHeight;
         hr = g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
         if (SUCCEEDED(hr))
         {
@@ -1253,6 +1291,9 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
             // Выделяем память для Режима 4 на основе точных размеров, принятых плееромФ
             if (g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
+                if (pMonochromeBuffer != nullptr) { delete[] pMonochromeBuffer; pMonochromeBuffer = nullptr; }
+                pMonochromeBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
+
                 if (::pStretchedBuffer != nullptr) { delete[] ::pStretchedBuffer; ::pStretchedBuffer = nullptr; }
                 ::pStretchedBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
             }
