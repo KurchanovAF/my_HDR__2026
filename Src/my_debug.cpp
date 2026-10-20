@@ -23,6 +23,12 @@ extern UINT* pMonochromeBuffer;                         // Буфер для м�
 extern UINT* pCompressedBuffer4x;                       // Буфер для хранения уменьшенной копии кадра на CPU
 extern UINT* pStretchedBuffer;                          // Буфер для хранения кадра, растянутого обратно после сжатия
 
+extern UINT* cpu_pPixelsBuffer;                             // Наш глобальный исходный массив кадра
+extern UINT* cpu_pRawPixels;                                // Наш глобальный массив кадра для CPU и отладки!
+extern UINT* cpu_pMonochromeBuffer;                         // Буфер для монохромного кадра CPU (Оригинал 1:1)
+extern UINT* cpu_pCompressedBuffer4x;                       // Буфер для хранения уменьшенной копии кадра на CPU
+extern UINT* cpu_pStretchedBuffer;                          // Буфер для хранения кадра, растянутого обратно после сжатия
+
 // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
 int                     g_dlgScrollX = 0; // Сдвиг по горизонтали для окна диагностики
 int                     g_dlgScrollY = 0; // Сдвиг по вертикали для окна диагностики
@@ -296,7 +302,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
                 if (hBmp && pBits)
                 {
-                    memcpy(pBits, pRawPixels, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
+                    memcpy(pBits, cpu_pRawPixels, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
                     HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
                     HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
@@ -316,9 +322,9 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 1: // Режим 2: Монохромный (КОНТРОЛЬ GPU ИЗ СКАЧАННОГО БУФЕРА ЧЕРЕЗ BITBLT)
+        case 1: // Режим 2: Монохромный (КОНТРОЛЬ GPU ИЗ ВЫДЕЛЕННОГО БУФЕРА СЛЕПКА)
         {
-            if (pRawPixels != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
+            if (cpu_pMonochromeBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
                 int startX = g_dlgScrollX;
                 int startY = g_dlgScrollY;
@@ -343,8 +349,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
                 if (hBmp && pBits)
                 {
-                    // Так как мы делим буфер pRawPixels, здесь уже лежит скачанный монохром от GPU
-                    memcpy(pBits, pMonochromeBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
+                    // КОНТРОЛЬ: Читаем строго из выделенного ЧБ-слепка видеокарты
+                    memcpy(pBits, cpu_pMonochromeBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
                     HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
                     HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
@@ -432,11 +438,10 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         }
         break;
 
-        case 3: // Режим 4: Растянутый после сжатия (ВЫВОД ИЗ ЧЕСТНОГО ПОЛНОРАЗМЕРНОГО МАССИВА)
+        case 3: // Режим 4: Растянутый после сжатия (КОНТРОЛЬ GPU ИЗ СКАЧАННОГО СЛЕПКА STAGE 2)
         {
             if (pStretchedBuffer != NULL && g_currentImgWidth > 0 && g_currentImgHeight > 0)
             {
-                // Берем координаты из обычных ползунков 1:1, а не из сжатых 8х8!
                 int startX = g_dlgScrollX;
                 int startY = g_dlgScrollY;
 
@@ -450,9 +455,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
 
                 BITMAPINFO bmi = {};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                // === ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНО ЗАДАЕМ ПОЛНЫЙ ИСХОДНЫЙ РАЗМЕР КАДРА ===
-                bmi.bmiHeader.biWidth = g_currentImgWidth;   // Строго полный размер (4128)
-                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight; // Строго полный размер (3096) с минусом
+                bmi.bmiHeader.biWidth = g_currentImgWidth;
+                bmi.bmiHeader.biHeight = -(int)g_currentImgHeight;
                 bmi.bmiHeader.biPlanes = 1;
                 bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = BI_RGB;
@@ -461,9 +465,8 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                 HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
                 if (hBmp && pBits)
                 {
-                    // Скоростное копирование памяти полноразмерного слепка
+                    // КОНТРОЛЬ: Читаем строго из выделенного полноразмерного слепка растяжения GPU
                     memcpy(pBits, pStretchedBuffer, g_currentImgWidth * g_currentImgHeight * sizeof(UINT));
-
                     HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
 
                     HBRUSH hBg = CreateSolidBrush(RGB(0, 0, 0));
@@ -473,9 +476,7 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
                     int viewW = ((startX + winW) > (int)g_currentImgWidth) ? (int)(g_currentImgWidth - startX) : winW;
                     int viewH = ((startY + winH) > (int)g_currentImgHeight) ? (int)(g_currentImgHeight - startY) : winH;
 
-                    // Копируем бит-в-бит на экран диагностической панели
                     BitBlt(hdc, 0, 0, viewW, viewH, hMemDC, startX, startY, SRCCOPY);
-
                     SelectObject(hMemDC, hOldBmp);
                     DeleteObject(hBmp);
                 }
@@ -483,7 +484,6 @@ LRESULT CALLBACK DiagnosticWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             }
         }
         break;
-
 
         case 4: hBrush = CreateSolidBrush(RGB(0, 50, 150));    // Режим 4 - Синий
             break;

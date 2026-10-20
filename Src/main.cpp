@@ -3,6 +3,9 @@
 #include <d3dcompiler.h>
 #include <cmath> // ИСПРАВЛЕНИЕ: Подключили математические функции sqrt и pow для CPU
 
+#include <wchar.h>
+#include <stdio.h>
+
 #include <commctrl.h>
 #pragma comment(lib, "comctl32.lib")
 
@@ -61,6 +64,7 @@ ID3D11Buffer* g_pConstantBuffer = NULL;
 
 // СТАДИЯ 0: Исходное цветное изображение (Оригинал 1:1)
 ID3D11Texture2D* g_pTexOriginal = nullptr;
+ID3D11RenderTargetView* g_pRTVOriginal = nullptr; // === ДОБАВИЛИ: холст для шейдера копирования ===
 ID3D11ShaderResourceView* g_pSRVOriginal = nullptr;
 ID3D11Texture2D* g_pStagingOriginal = nullptr;
 
@@ -695,6 +699,23 @@ void Render()
     float renderW = (float)fileWidth;
     float renderH = (float)fileHeight;
 
+    // Отрендерим "шашечки" строго до вызова CopyResource, чтобы текстура успела наполниться!
+    if (g_pRTVOriginal && g_pTextureSRV && g_pPixelShaderCopy)
+    {
+        float ClearColorO[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        g_pImmediateContext->ClearRenderTargetView(g_pRTVOriginal, ClearColorO);
+        g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVOriginal, NULL);
+
+        // Включаем шейдер копирования и подаем входную текстуру
+        g_pImmediateContext->PSSetShader(g_pPixelShaderCopy, NULL, 0);
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+        g_pImmediateContext->Draw(4, 0);
+
+        // Чисто разрываем связи перед скачиванием в CPU
+        g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
+        g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+    }
+
     // === КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ ИСХОДНОГО ОРИГИНАЛА ===
     if (g_bNeedCopyOriginal && g_pTexOriginal && g_pStagingOriginal && pRawPixels != NULL)
     {
@@ -703,13 +724,22 @@ void Render()
         if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingOriginal, 0, D3D11_MAP_READ, 0, &mappedResource)))
         {
             BYTE* pSrc = (BYTE*)mappedResource.pData;
-            BYTE* pDst = (BYTE*)pRawPixels;
+            BYTE* pDst = (BYTE*)cpu_pRawPixels;
             UINT rowSize = g_currentImgWidth * sizeof(UINT);
             for (UINT y = 0; y < g_currentImgHeight; y++)
             {
                 memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
             }
             g_pImmediateContext->Unmap(g_pStagingOriginal, 0);
+        }
+        else
+        {
+            // Этот блок сработает во всех кадрах, когда скачивание НЕ происходит
+            // Выведем текстовое предупреждение, чтобы понять состояние флага
+            if (g_bNeedCopyOriginal == true)
+            {
+                ::MessageBoxW(hwnd, L"Критический сбой: Флаг TRUE, но скачивание заблокировано (указатели NULL)!", L"Аудит GPU", MB_OK | MB_ICONERROR);
+            }
         }
         g_bNeedCopyOriginal = false;
     }
@@ -877,34 +907,44 @@ void Render()
     // ПАСС НУЛЕВОЙ: ЗАПУСК ПЕРВОГО ШАГА СЖАТИЯ (БЛОКИ 4х4 В КАНАЛЫ R, G, B, A)
     // ========================================================================
 
-    // === 1. КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ ИСХОДНОГО ЦВЕТНОГО ОРИГИНАЛА ===
-    if (g_bNeedCopyOriginal && g_pTexOriginal && g_pStagingOriginal && pRawPixels != NULL)
+    // === 2. КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА (РЕЖИМ 2) ===
+    // Отрендерим ЧБ строго ДО вызова CopyResource, чтобы текстура успела наполниться пикселями!
+    if (g_pRTVMonochrome && g_pTextureSRV && g_pPixelShaderMonochrome)
     {
-        g_pImmediateContext->CopyResource(g_pStagingOriginal, g_pTexOriginal);
-        D3D11_MAPPED_SUBRESOURCE mappedResource;
-        if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingOriginal, 0, D3D11_MAP_READ, 0, &mappedResource)))
-        {
-            BYTE* pSrc = (BYTE*)mappedResource.pData;
-            BYTE* pDst = (BYTE*)pRawPixels; // Цветной оригинал пишем в универсальный pRawPixels
-            UINT rowSize = g_currentImgWidth * sizeof(UINT);
-            for (UINT y = 0; y < g_currentImgHeight; y++)
-            {
-                memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
-            }
-            g_pImmediateContext->Unmap(g_pStagingOriginal, 0);
-        }
-        g_bNeedCopyOriginal = false;
+        float ClearColorM[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        g_pImmediateContext->ClearRenderTargetView(g_pRTVMonochrome, ClearColorM);
+        g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVMonochrome, NULL);
+
+        // Настраиваем область просмотра под полный размер кадра 1:1
+        D3D11_VIEWPORT vpMono = { 0.0f, 0.0f, (float)g_currentImgWidth, (float)g_currentImgHeight, 0.0f, 1.0f };
+        g_pImmediateContext->RSSetViewports(1, &vpMono);
+
+        // Принудительно передаем геометрию экрана, чтобы Draw(4,0) отработал по всей площади кадра
+        UINT mStride = sizeof(SimpleVertex);
+        UINT mOffset = 0;
+        g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &mStride, &mOffset);
+        g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        g_pImmediateContext->UpdateSubresource(g_pVertexBuffer, 0, NULL, masterVerticesQuad, 0, 0);
+
+        // Включаем шейдер монохроматизации и подаем на вход оригинальную цветную текстуру
+        g_pImmediateContext->PSSetShader(g_pPixelShaderMonochrome, NULL, 0);
+        g_pImmediateContext->PSSetShaderResources(0, 1, &g_pSRVOriginal);
+        g_pImmediateContext->Draw(4, 0);
+
+        // Чисто разрываем связи перед выгрузкой в CPU
+        g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
+        g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     }
 
-    // === 2. КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА (РЕЖИМ 2) ===
-    if (g_bNeedCopyMonochrome && g_pTexMonochrome && g_pStagingMonochrome && pMonochromeBuffer != NULL)
+    // === КОНТРОЛЬ GPU: ОДНОКРАТНОЕ СКАЧИВАНИЕ МОНОХРОМА ===
+    if (g_bNeedCopyMonochrome && g_pTexMonochrome && g_pStagingMonochrome && cpu_pMonochromeBuffer != NULL)
     {
         g_pImmediateContext->CopyResource(g_pStagingMonochrome, g_pTexMonochrome);
         D3D11_MAPPED_SUBRESOURCE mappedResource;
         if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingMonochrome, 0, D3D11_MAP_READ, 0, &mappedResource)))
         {
             BYTE* pSrc = (BYTE*)mappedResource.pData;
-            BYTE* pDst = (BYTE*)pMonochromeBuffer; // Честный ЧБ слепок пишем строго в pMonochromeBuffer
+            BYTE* pDst = (BYTE*)cpu_pMonochromeBuffer; // СТАЛО: Пишем слепок GPU строго в новый буфер контроля
             UINT rowSize = g_currentImgWidth * sizeof(UINT);
             for (UINT y = 0; y < g_currentImgHeight; y++)
             {
@@ -912,7 +952,15 @@ void Render()
             }
             g_pImmediateContext->Unmap(g_pStagingMonochrome, 0);
         }
-        g_bNeedCopyMonochrome = false; // Опускаем наш выделенный флаг
+        else
+        {
+            // Проверяем: если флаг взведен, но мы улетели в else — значит, указатели текстур равны NULL
+            if (g_bNeedCopyMonochrome == true)
+            {
+                ::MessageBoxW(hwnd, L"Сбой Монохрома: Флаг TRUE, но ресурсы GPU равны NULL!", L"Аудит Монохрома", MB_OK | MB_ICONERROR);
+            }
+        }
+        g_bNeedCopyMonochrome = false;
     }
 
     // === АППАРАТНЫЙ ПАСС GPU: ПЕРЕВОД ОРИГИНАЛА 1:1 В МОНОХРОМ ===
@@ -1014,18 +1062,31 @@ void Render()
     // ========================================================================
     // НОВЫЙ БЛОК: СКАЧИВАНИЕ ГОТОВОГО СЛЕПКА GPU ДЛЯ КОНТРОЛЯ В РЕЖИМЕ 4
     // ========================================================================
-    if (g_bNeedCopyStretched && g_pSRVStretched && g_pStagingStretched)
+    if (g_bNeedCopyStretched && g_pSRVStretched && g_pStagingStretched && cpu_pStretchedBuffer != NULL)
     {
         ID3D11Resource* pResSource = nullptr;
         g_pSRVStretched->GetResource(&pResSource);
-
         if (pResSource)
         {
             g_pImmediateContext->CopyResource(g_pStagingStretched, pResSource);
             pResSource->Release();
+
+            // Процессор ОДИН раз забирает аппаратную копию растяжения в ОЗУ
+            D3D11_MAPPED_SUBRESOURCE mappedResource;
+            if (SUCCEEDED(g_pImmediateContext->Map(g_pStagingStretched, 0, D3D11_MAP_READ, 0, &mappedResource)))
+            {
+                BYTE* pSrc = (BYTE*)mappedResource.pData;
+                BYTE* pDst = (BYTE*)cpu_pStretchedBuffer; // Пишем строго в новый буфер Режима 4
+                UINT rowSize = g_currentImgWidth * sizeof(UINT);
+                for (UINT y = 0; y < g_currentImgHeight; y++)
+                {
+                    memcpy(pDst + (y * rowSize), pSrc + (y * mappedResource.RowPitch), rowSize);
+                }
+                g_pImmediateContext->Unmap(g_pStagingStretched, 0);
+            }
         }
+        g_bNeedCopyStretched = false;
     }
-    g_bNeedCopyStretched = false;
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
     g_pImmediateContext->OMSetRenderTargets(1, nullRTV, NULL);
@@ -1113,6 +1174,23 @@ void Render()
     g_pImmediateContext->Draw(4, 0);
 
     g_pImmediateContext->PSSetShaderResources(0, 1, nullSRV);
+
+    // === ТЕСТОВАЯ ДИАГНОСТИКА КОНВЕЙЕРА В СТРОКУ СТАТУСА ===
+    wchar_t statusBuf[256];
+    wsprintfW(statusBuf, L"TexMono: %s | StagingMono: %s | Флаг Mono: %s",
+        (g_pTexMonochrome != NULL) ? L"СОЗДАН" : L"NULL!",
+        (g_pStagingMonochrome != NULL) ? L"СОЗДАН" : L"NULL!",
+        g_bNeedCopyMonochrome ? L"TRUE" : L"FALSE");
+
+    // Отправляем строку в статус-бар главного окна (hWnd - дескриптор вашего главного окна)
+    SetWindowText(g_hStatusWnd, statusBuf);
+    wsprintfW(statusBuf, L"TexOrig: %s | StagingOrig: %s | Размеры: %dx%d",
+        (g_pTexOriginal != NULL) ? L"СОЗДАН" : L"NULL!",
+        (g_pStagingOriginal != NULL) ? L"СОЗДАН" : L"NULL!",
+        (int)g_currentImgWidth,
+        (int)g_currentImgHeight);
+    ::SetWindowTextW(hwnd, statusBuf);
+
     g_pSwapChain->Present(0, 0);
 }
 
@@ -1423,6 +1501,41 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
 
                 if (::pStretchedBuffer != nullptr) { delete[] ::pStretchedBuffer; ::pStretchedBuffer = nullptr; }
                 ::pStretchedBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+                // === КАНАЛ СТАДИИ 0: ФИЗИЧЕСКОЕ СОЗДАНИЕ ДИНАМИЧЕСКИХ РЕСУРСОВ НА GPU ===
+                if (g_pTexOriginal) { g_pTexOriginal->Release(); g_pTexOriginal = nullptr; }
+                if (g_pRTVOriginal) { g_pRTVOriginal->Release(); g_pRTVOriginal = nullptr; }
+                if (g_pSRVOriginal) { g_pSRVOriginal->Release(); g_pSRVOriginal = nullptr; }
+                if (g_pStagingOriginal) { g_pStagingOriginal->Release(); g_pStagingOriginal = nullptr; }
+
+                D3D11_TEXTURE2D_DESC descOrig = {};
+                descOrig.Width = imgWidth;   // Здесь эти переменные гарантированно определены процессором!
+                descOrig.Height = imgHeight;
+                descOrig.MipLevels = 1;
+                descOrig.ArraySize = 1;
+                descOrig.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                descOrig.SampleDesc.Count = 1;
+                descOrig.Usage = D3D11_USAGE_DEFAULT;
+                descOrig.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+                hr = g_pd3dDevice->CreateTexture2D(&descOrig, nullptr, &g_pTexOriginal);
+                if (SUCCEEDED(hr))
+                {
+                    g_pd3dDevice->CreateRenderTargetView(g_pTexOriginal, nullptr, &g_pRTVOriginal);
+                    g_pd3dDevice->CreateShaderResourceView(g_pTexOriginal, nullptr, &g_pSRVOriginal);
+                }
+
+                D3D11_TEXTURE2D_DESC descStageOrig = descOrig;
+                descStageOrig.Usage = D3D11_USAGE_STAGING;
+                descStageOrig.BindFlags = 0;
+                descStageOrig.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                g_pd3dDevice->CreateTexture2D(&descStageOrig, nullptr, &g_pStagingOriginal);
+
+                // === ИСПРАВЛЕНИЕ: МАТЕРИАЛИЗУЕМ СЛЕПКОПРИЕМНИК ДЛЯ МОНОХРОМА СТАДИИ 1 ===
+                if (g_pStagingMonochrome) { g_pStagingMonochrome->Release(); g_pStagingMonochrome = nullptr; }
+
+                // Переиспользуем готовую структуру staging-описания, так как размеры и форматы полностью совпадают
+                g_pd3dDevice->CreateTexture2D(&descStageOrig, nullptr, &g_pStagingMonochrome);
             }
             // === НОВОЕ: Выделяем память под эталонные буферы алгоритмов CPU ===
             if (cpu_pRawPixels != nullptr) { delete[] cpu_pRawPixels; cpu_pRawPixels = nullptr; }

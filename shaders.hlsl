@@ -244,8 +244,28 @@ float4 PS_Final(VS_OUTPUT input) : SV_Target
 }
 
 // Простой шейдер копирования кадра для ЭТАПА II
+/*
 float4 PS_Copy(VS_OUTPUT input) : SV_Target
 {
+    // Генерируем 32 клетки по горизонтали и вертикали
+    int cx = (int)(input.Tex.x * 32.0f);
+    int cy = (int)(input.Tex.y * 32.0f);
+    
+    // Меняем фазу цвета в шахматном порядке
+    if ((cx + cy) % 2 == 0)
+    {
+        return float4(1.0f, 1.0f, 0.0f, 1.0f); // Ярко-желтый квадрат
+    }
+    else
+    {
+        return float4(0.0f, 0.0f, 1.0f, 1.0f); // Ярко-синий квадрат
+    }
+}
+*/
+
+float4 PS_Copy(VS_OUTPUT input) : SV_Target
+{
+    // Возвращаем нативное чтение текстуры один к одному
     return srcTexture.Sample(samplerState0, input.Tex);
 }
 
