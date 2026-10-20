@@ -11,17 +11,17 @@
 HWND                     g_hDlgWnd = NULL;              // Дескриптор диагностического окна Windows
 HWND                     g_hDlgStatusWnd = NULL;        // Строка статуса диагностического окна панели
 IDXGISwapChain* g_pDlgSwapChain = NULL;        // Цепочка буферов для второго экрана
-ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL; // Цель отрисовки диагностического окна
+ID3D11RenderTargetView* g_pDlgRenderTargetView = NULL;  // Цель отрисовки диагностического окна
 void CreateDiagnosticWindow(HINSTANCE hInstance, HWND hParentWnd);
 int                      g_diagMode = 1;                // Текущий режим панели: 1, 2, 3 или 4
 ID3D11Texture2D* g_pMacroStaging = NULL;                // Промежуточная текстура для передачи данных из GPU в CPU
-extern ID3D11Texture2D* g_pStagingCompressed;              // Промежуточная текстура для оригинала кадра
+extern ID3D11Texture2D* g_pStagingCompressed;           // Промежуточная текстура для оригинала кадра
 
-UINT* pPixelsBuffer = NULL;                             // Наш глобальный исходный массив кадра
-UINT* pRawPixels = NULL;                                // Наш глобальный массив кадра для CPU и отладки!
-UINT* pMonochromeBuffer = NULL;                         // Буфер для монохромного кадра CPU (Оригинал 1:1)
-UINT* pCompressedBuffer4x = NULL;                       // Буфер для хранения уменьшенной копии кадра на CPU
-UINT* pStretchedBuffer = NULL;                          // Буфер для хранения кадра, растянутого обратно после сжатия
+extern UINT* pPixelsBuffer;                             // Наш глобальный исходный массив кадра
+extern UINT* pRawPixels;                                // Наш глобальный массив кадра для CPU и отладки!
+extern UINT* pMonochromeBuffer;                         // Буфер для монохромного кадра CPU (Оригинал 1:1)
+extern UINT* pCompressedBuffer4x;                       // Буфер для хранения уменьшенной копии кадра на CPU
+extern UINT* pStretchedBuffer;                          // Буфер для хранения кадра, растянутого обратно после сжатия
 
 // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
 int                     g_dlgScrollX = 0; // Сдвиг по горизонтали для окна диагностики

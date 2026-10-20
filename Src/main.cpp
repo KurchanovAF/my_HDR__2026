@@ -151,25 +151,35 @@ bool g_bNeedCopyOriginal = true;    // Флаг для копии исходно
 bool g_bNeedCopyMonochrome = true;
 bool g_bNeedCopyStage3 = true;      // Флаг для монохромного кадра (Стадия 3)
 bool g_bNeedCopyCompressed = true;  // Флаг для макроструктуры 8х8 (Стадия 2)
-bool g_bNeedCopyStretched = true;  // НОВЫЙ уникальный флаг для Режима 4!
+bool g_bNeedCopyStretched = true;   // НОВЫЙ уникальный флаг для Режима 4!
 
 // === ОБЪЯВЛЕНИЕ ВНЕШНИХ ПЕРЕМЕННЫХ ИЗ ПАНЕЛИ ДИАГНОСТИКИ ===
-extern UINT* pPixelsBuffer;
-extern UINT* pRawPixels;
-extern UINT* pMonochromeBuffer;
+UINT* pPixelsBuffer = NULL;
+UINT* cpu_pRawPixels = NULL;            // Исходный цветной кадр 1:1 для алгоритмов CPU
+UINT* cpu_pMonochromeBuffer = NULL;     // Монохромный оригинал 1:1, рассчитанный процессором
+UINT* cpu_pCompressed4x = NULL;         // Первый каскад сжатия CPU (макроструктура 4х4 / 8х8)
+UINT* cpu_pDoubleCompressed16x = NULL;  // ВТОРОЙ КАСКАД сжатия CPU (глобальный фон 16х16)
+UINT* cpu_pStretchedBuffer = NULL;      // Растянутый процессором фон под гамму
+UINT* cpu_pDifferenceBuffer = NULL;
+
+// === ПОЛНЫЙ НАБОР ЭТАЛОННЫХ БУФЕРОВ ОЗУ СТРОГО ДЛЯ РАСЧЕТОВ CPU ===
+UINT* pRawPixels = NULL;
+UINT* pMonochromeBuffer = NULL;
+UINT* pCompressedBuffer4x = NULL;   // Внешний буфер сжатия из my_debug.cpp
+UINT* pDoubleCompressed16x = NULL;
+UINT* pStretchedBuffer = NULL;      // Буфер для хранения кадра, растянутого обратно после сжатия
+UINT* pDifferenceBuffer = NULL;
 extern ID3D11Texture2D* g_pStagingCompressed;
-extern UINT* pCompressedBuffer4x;   // Внешний буфер сжатия из my_debug.cpp
-extern UINT* pStretchedBuffer;      // Буфер для хранения кадра, растянутого обратно после сжатия
 
 #define my_DRBUG
 #ifdef my_DEBUG
 #include my_debug.c
 #endif
 
-// === НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПРОГРАММНОГО РЕЖИМА (CPU) ===
-bool                      g_bUseCPUProcessing = false; // true - процессор, false - видеокарта
-ID3D11Texture2D* g_pCpuTexture = NULL;        // Промежуточный холст для пикселей от CPU
-ID3D11ShaderResourceView* g_pCpuTextureSRV = NULL;     // Ресурс чтения результата CPU для шторки
+// === НЕИЗМЕННЫЕ ПЕРЕМЕННЫЕ ПРОГРАММНОГО РЕЖИМА (CPU) ===
+bool g_bUseCPUProcessing = false;       // true - процессор, false - видеокарта
+ID3D11Texture2D* g_pCpuTexture = NULL;  // Промежуточный холст для пикселей от CPU
+ID3D11ShaderResourceView* g_pCpuTextureSRV = NULL; // Ресурс чтения результата CPU для шторки
 
 // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ПОЛОС ПРОКРУТКИ ===
 int                       g_scrollX = 0; // Текущий сдвиг картинки по горизонтали в пикселях
@@ -452,6 +462,20 @@ HRESULT InitDevice(HWND hwnd)
     pPSMonoBlob->Release();
     if (FAILED(hr)) return hr;
     // === КОНЕЦ НОВОГО КОДА ===
+    // === ПРИНУДИТЕЛЬНОЕ ВЫДЕЛЕНИЕ СТАРТОВОЙ ПАМЯТИ 2х2 ДЛЯ ОШИБОК С6001 ===
+    g_currentImgWidth = 2;
+    g_currentImgHeight = 2;
+    if (pRawPixels == NULL) pRawPixels = new UINT[2 * 2]{ 0 };
+    if (pPixelsBuffer == NULL) pPixelsBuffer = new UINT[2 * 2]{ 0 };
+    if (pMonochromeBuffer == NULL) pMonochromeBuffer = new UINT[2 * 2]{ 0 };
+    if (pStretchedBuffer == NULL) pStretchedBuffer = new UINT[2 * 2]{ 0 };
+
+    if (cpu_pRawPixels == NULL) cpu_pRawPixels = new UINT[2 * 2]{ 0 };
+    if (cpu_pMonochromeBuffer == NULL) cpu_pMonochromeBuffer = new UINT[2 * 2]{ 0 };
+    if (cpu_pCompressed4x == NULL) cpu_pCompressed4x = new UINT[2 * 2]{ 0 };
+    if (cpu_pDoubleCompressed16x == NULL) cpu_pDoubleCompressed16x = new UINT[2 * 2]{ 0 };
+    if (cpu_pStretchedBuffer == NULL) cpu_pStretchedBuffer = new UINT[2 * 2]{ 0 };
+    if (cpu_pDifferenceBuffer == NULL) cpu_pDifferenceBuffer = new UINT[2 * 2]{ 0 };
 
     // Создаем тестовую текстуру 2х2 пикселя (Черный и Белый в шахматном порядке)
     UINT textureData[] = {
@@ -1400,6 +1424,24 @@ HRESULT LoadTextureFromFile(const WCHAR* szFileName)
                 if (::pStretchedBuffer != nullptr) { delete[] ::pStretchedBuffer; ::pStretchedBuffer = nullptr; }
                 ::pStretchedBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
             }
+            // === НОВОЕ: Выделяем память под эталонные буферы алгоритмов CPU ===
+            if (cpu_pRawPixels != nullptr) { delete[] cpu_pRawPixels; cpu_pRawPixels = nullptr; }
+            cpu_pRawPixels = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+            if (cpu_pMonochromeBuffer != nullptr) { delete[] cpu_pMonochromeBuffer; cpu_pMonochromeBuffer = nullptr; }
+            cpu_pMonochromeBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+            if (cpu_pCompressed4x != nullptr) { delete[] cpu_pCompressed4x; cpu_pCompressed4x = nullptr; }
+            cpu_pCompressed4x = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+            if (cpu_pDoubleCompressed16x != nullptr) { delete[] cpu_pDoubleCompressed16x; cpu_pDoubleCompressed16x = nullptr; }
+            cpu_pDoubleCompressed16x = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+            if (cpu_pStretchedBuffer != nullptr) { delete[] cpu_pStretchedBuffer; cpu_pStretchedBuffer = nullptr; }
+            cpu_pStretchedBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
+
+            if (cpu_pDifferenceBuffer != nullptr) { delete[] cpu_pDifferenceBuffer; cpu_pDifferenceBuffer = nullptr; }
+            cpu_pDifferenceBuffer = new UINT[g_currentImgWidth * g_currentImgHeight];
         }
 
         // === НОВЫЙ КОД: ЗАПУСК ПРОГРАММНОЙ ОБРАБОТКИ CPU ПРИ ОТКРЫТИИ ФАЙЛА ===
