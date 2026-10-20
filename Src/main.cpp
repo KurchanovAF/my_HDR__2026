@@ -941,7 +941,7 @@ void Render()
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRTVCompressed, nullptr);
     g_pImmediateContext->RSSetViewports(1, &vpStage1);
     g_pImmediateContext->PSSetShader(g_pPixelShaderDown, nullptr, 0);
-    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pTextureSRV);
+    g_pImmediateContext->PSSetShaderResources(0, 1, &g_pSRVMonochrome);
     g_pImmediateContext->Draw(4, 0);
 
     // Жестко отвязываем холст Первой Стадии от записи, закрывая его
